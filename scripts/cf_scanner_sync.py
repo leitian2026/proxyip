@@ -179,7 +179,7 @@ def main():
     else:
         print(f"Target Regions dynamically set to: {target_regions}")
     
-    check_api_url = "https://proxyip.xxxxxxxx.nyc.mn/check"
+    check_api_url = os.environ.get("CHECK_API_URL")
     sync_count = SYNC_COUNT
     scan_count = SCAN_COUNT
     
