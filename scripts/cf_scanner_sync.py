@@ -214,7 +214,37 @@ def select_diverse_ips(sorted_ips, limit, max_per_subnet=MAX_PER_SUBNET):
     return selected
 
 
-def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, allow_delete=True):
+def select_diverse_merged(new_items, existing_ips, target_count, max_per_subnet=MAX_PER_SUBNET):
+    """
+    把"本次新测出的结果"(new_items，需已按延迟从低到高排序，优先级更高)
+    和 "Cloudflare上现有的旧记录"(existing_ips，纯IP字符串，优先级较低)放在一起，
+    按 /16、/24 网段配额(各最多 max_per_subnet 个)选出最终名单，总数不超过 target_count。
+
+    网段配额被占满时，不管候选是新是旧都会被跳过——因为新结果排在前面优先占位，
+    实际效果是"网段里已经重复"的旧记录会被优先挤掉，总数也会稳定收敛在 target_count
+    附近，不会因为"这次没测够"就无限累积。
+    """
+    new_ip_order = [item["ip"] for item in new_items]
+    new_ip_set = set(new_ip_order)
+    ordered_ips = new_ip_order + [ip for ip in existing_ips if ip not in new_ip_set]
+
+    kept = []
+    count24, count16 = {}, {}
+    for ip in ordered_ips:
+        parts = ip.split(".")
+        key24 = ".".join(parts[:3])
+        key16 = ".".join(parts[:2])
+        if count24.get(key24, 0) >= max_per_subnet or count16.get(key16, 0) >= max_per_subnet:
+            continue
+        kept.append(ip)
+        count24[key24] = count24.get(key24, 0) + 1
+        count16[key16] = count16.get(key16, 0) + 1
+        if len(kept) >= target_count:
+            break
+    return kept
+
+
+def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count, max_per_subnet=MAX_PER_SUBNET):
     headers = {
         "X-Auth-Email": cf_email,
         "X-Auth-Key": api_token,
@@ -231,20 +261,21 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, al
 
         existing_records = resp.get("result", [])
         existing_map = {r["content"]: r["id"] for r in existing_records}
-        desired_ips = [ip["ip"] for ip in best_ips]
+        existing_ips = list(existing_map.keys())
 
-        # 1. 删除不再需要的旧记录（仅在 allow_delete=True 时执行）
-        if allow_delete:
-            for ip_val, record_id in existing_map.items():
-                if ip_val not in desired_ips:
-                    print(f"Deleting outdated IP: {ip_val}")
-                    del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-                    requests.delete(del_url, headers=headers)
-        else:
-            print("本次筛选数量不足 sync_count，跳过删除旧记录（避免收窄到同一网段），仅追加新IP。")
+        # best_ips 已经按延迟排好序（调用方保证），跟CF上现有记录合并后重新选出最终名单
+        final_ips = select_diverse_merged(best_ips, existing_ips, target_count=sync_count, max_per_subnet=max_per_subnet)
+        final_set = set(final_ips)
 
-        # 2. 追加新IP（不管 allow_delete 与否，新IP都正常添加）
-        for ip_val in desired_ips:
+        # 1. 删除不在最终名单里的旧记录（可能是过期的，也可能是网段配额被挤掉的重复项）
+        for ip_val, record_id in existing_map.items():
+            if ip_val not in final_set:
+                print(f"Deleting outdated/over-quota IP: {ip_val}")
+                del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+                requests.delete(del_url, headers=headers)
+
+        # 2. 追加最终名单里CF上还没有的新IP
+        for ip_val in final_ips:
             if ip_val not in existing_map:
                 print(f"Adding new IP: {ip_val}")
                 post_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
@@ -257,7 +288,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, al
                 }
                 requests.post(post_url, headers=headers, json=data)
 
-        print("Cloudflare DNS Sync completed successfully!")
+        print(f"Cloudflare DNS Sync completed successfully! ({len(final_ips)}/{sync_count} records)")
         return True
     except Exception as e:
         print(f"Exception during Cloudflare sync: {e}")
@@ -452,11 +483,8 @@ def main():
 
         if can_sync:
             target_domain = f"{region.lower()}.{base_domain}"
-            allow_delete = len(best_ips) >= sync_count
-            if not allow_delete:
-                print(f"注意: {region} 本次仅选出 {len(best_ips)}/{sync_count} 个(原始命中不足或受网段多样性限制)，跳过删除旧记录，只追加新IP。")
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
-            sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, allow_delete=allow_delete)
+            sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
         else:
             print(f"\nSkipping Cloudflare DNS Sync for {region} (Missing Credentials).")
 
@@ -464,7 +492,7 @@ def main():
         if SYNC_MAIN_DOMAIN.strip().upper() == "YES":
             all_best_ips.sort(key=lambda x: x["latency"])
             print(f"\n[Global Sync] Starting Cloudflare DNS Sync for MAIN DOMAIN: {base_domain}")
-            sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, allow_delete=True)
+            sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, sync_count=len(all_best_ips))
         else:
             print(f"\n[Global Sync] Skipped synchronizing to MAIN DOMAIN ({base_domain}) because SYNC_MAIN_DOMAIN is set to NO.")
 
