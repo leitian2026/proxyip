@@ -264,11 +264,13 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, al
         return False
 
 
-def save_ips_to_file(new_best_ips, file_path="ips-v4.txt"):
+def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET):
     """
-    合并写入，而不是覆盖写入：
-    读出文件里已有的历史IP，和这次新选出的 best_ips 合并（同一个IP以本次结果刷新
-    地区备注，历史IP永久保留、不会因为这次运行就消失），再整体写回。
+    合并写入，而不是覆盖写入，且对最终结果也做 /16、/24 双层去重：
+    - 读出文件里已有的历史IP，和这次新选出的 best_ips 合并（同一个IP以本次结果刷新地区备注）
+    - 本次新结果按延迟从低到高排序，优先占用网段配额；历史遗留条目排在后面，
+      抢不到配额（同 /16 或同 /24 已经有 max_per_subnet 个更优先的条目）的旧条目
+      会被自然淘汰、不再写回文件——避免同一网段的历史记录无限堆积
     """
     existing = {}  # ip -> colo
     if os.path.exists(file_path):
@@ -287,14 +289,38 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt"):
             print(f"Warning: 读取历史 {file_path} 失败，将只写入本次结果: {e}")
 
     before_count = len(existing)
+
+    # 本次新结果按延迟从低到高排序，延迟低的优先占用网段配额
+    new_sorted = sorted(new_best_ips, key=lambda x: x["latency"])
+    new_ip_order = [item["ip"] for item in new_sorted]
+    new_ip_set = set(new_ip_order)
+
     for item in new_best_ips:
         existing[item["ip"]] = item["colo"]
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        for ip, colo in existing.items():
-            f.write(f"{ip}#{colo}\n")
+    # 排队顺序：本次新结果（延迟从低到高）优先，历史遗留条目排在后面
+    ordered_ips = new_ip_order + [ip for ip in existing if ip not in new_ip_set]
 
-    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(existing)} total (history preserved).")
+    kept = []
+    count24, count16 = {}, {}
+    dropped = 0
+    for ip in ordered_ips:
+        parts = ip.split(".")
+        key24 = ".".join(parts[:3])
+        key16 = ".".join(parts[:2])
+        if count24.get(key24, 0) >= max_per_subnet or count16.get(key16, 0) >= max_per_subnet:
+            dropped += 1
+            continue
+        kept.append(ip)
+        count24[key24] = count24.get(key24, 0) + 1
+        count16[key16] = count16.get(key16, 0) + 1
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        for ip in kept:
+            f.write(f"{ip}#{existing[ip]}\n")
+
+    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> "
+          f"{len(kept)} kept after /16+/24 dedup ({dropped} over-quota entries pruned, history not indefinitely growing).")
 
 
 def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit):
