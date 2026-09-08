@@ -343,9 +343,6 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     dropped = 0
     for ip in ordered_ips:
         parts = ip.split(".")
-        if len(parts) != 4:
-            dropped += 1
-            continue
         if parts[0] == "1" and parts[1] == "2":
             kept.append(ip)
         else:
