@@ -1,8 +1,7 @@
 import os
 import random
-import socket
 import time
-import re
+import threading
 import requests
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
@@ -20,10 +19,29 @@ DEFAULT_REGIONS = "SJC"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-# 控制每个地区最终要同步几个 IP 到 Cloudflare DNS (默认 10 个)
-SYNC_COUNT = 10
-# 控制每次随机生成多少个 IP 去抽卡测速 (默认 2000 个)
-SCAN_COUNT = 2000
+SYNC_COUNT = 10       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
+ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
+
+# === 网段多样性设置 ===
+# 最终筛选时，同一个 /16、同一个 /24 网段最多各能入选几个 IP（两层都要满足）
+# 避免最终同步出去的 IP 全部挤在同一网段（同一条线路/同一机房），起不到冗余作用
+MAX_PER_SUBNET = 2
+
+# === 扫描资源上限设置（取代原来的 SCAN_COUNT / max_attempts 轮次概念）===
+# 现在是"流式扫描"：线程池维持恒定并发数，每完成一个就检查一次状态，
+# 不再有"一批测2000个、测完再看下一批"这种轮次划分。
+CONCURRENCY = 50             # 同时并发的测速请求数（已验证稳定运行多日，不再收紧）
+TOTAL_REQUEST_LIMIT = 20000  # 整个扫描阶段最多发起多少次测速请求（硬上限，沿用原来"批次x轮次"的隐含总量；
+                             # 不管有没有凑够数，达到这个数就无条件停止扫描）
+
+# === 热点网段候选权重（取代原来单一的 /24 热点段）===
+# 同时维护 /24、/16 两种粒度的历史热点网段，生成随机 IP 时按权重从三档里抽：
+# 60% 从历史 /24 热点段抽 -> 命中率最高，最省请求
+# 25% 从历史 /16 热点段抽 -> 范围更广，兼顾同一大网段下的新 /24
+# 15% 从全量 CF_CIDRS 纯随机抽 -> 唯一能发现全新网段、维持 ips-v4.txt 网段库多样性的来源
+HOT_24_WEIGHT = 0.60
+HOT_16_WEIGHT = 0.25
+# 剩下的 0.15 概率落到全量池，不单独定义变量
 # ==========================================
 
     # === Cloudflare IPv4 Ranges (IP段配置区) ===
@@ -46,92 +64,186 @@ def load_cf_cidrs(file_path="ip.txt"):
 CF_CIDRS = load_cf_cidrs()
     # ==========================================
 
-def generate_random_ip(hot_cidrs=None):
-    # 如果有热点网段，并且掷骰子命中 50% 概率，就从热点网段里抽；否则从大网段抽
-    for _ in range(10): # 避免死循环，最多重试 10 次
+
+# === 全局网段配额计数 ===
+# 用于生成阶段实时排除"已经测满的网段"，避免浪费请求。
+# 采用全局口径：不区分地区(colo)，只要这个网段全局已经收集到 MAX_PER_SUBNET 个
+# 被实际采纳的有效IP，后续生成候选IP时就主动跳过这个网段。
+_subnet_lock = threading.Lock()
+_subnet24_count = {}
+_subnet16_count = {}
+
+
+def _is_cidr_full(cidr):
+    """判断一个 /24 或 /16 的 CIDR 网段是否已经达到全局配额上限"""
+    try:
+        base, prefix = cidr.split("/")
+        prefix = int(prefix)
+    except Exception:
+        return False
+    parts = base.split(".")
+    with _subnet_lock:
+        if prefix == 24:
+            key = ".".join(parts[:3])
+            return _subnet24_count.get(key, 0) >= MAX_PER_SUBNET
+        elif prefix == 16:
+            key = ".".join(parts[:2])
+            return _subnet16_count.get(key, 0) >= MAX_PER_SUBNET
+    return False
+
+
+def _record_valid_ip(ip):
+    """一个IP被实际采纳进某地区候选池时调用，更新全局网段配额计数"""
+    parts = ip.split(".")
+    key24 = ".".join(parts[:3])
+    key16 = ".".join(parts[:2])
+    with _subnet_lock:
+        _subnet24_count[key24] = _subnet24_count.get(key24, 0) + 1
+        _subnet16_count[key16] = _subnet16_count.get(key16, 0) + 1
+
+
+def load_hot_subnets(file_path="ips-v4.txt"):
+    """从历史结果文件里提取 /24 和 /16 两种粒度的热点网段（用于生成阶段加权抽样）"""
+    hot_24, hot_16 = set(), set()
+    if os.path.exists(file_path):
         try:
-            if hot_cidrs and random.random() < 0.5:
-                cidr = random.choice(hot_cidrs)
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    ip_str = line.split("#")[0].strip()
+                    parts = ip_str.split(".")
+                    if len(parts) == 4:
+                        hot_24.add(f"{parts[0]}.{parts[1]}.{parts[2]}.0/24")
+                        hot_16.add(f"{parts[0]}.{parts[1]}.0.0/16")
+        except Exception as e:
+            print(f"Warning: 读取历史热点网段失败: {e}")
+    return list(hot_24), list(hot_16)
+
+
+def _random_ip_from_cidr(cidr):
+    """在给定的单个 CIDR 网段内随机生成一个 IP"""
+    if '/' in cidr:
+        base_ip, prefix = cidr.split('/')
+        prefix = int(prefix)
+    else:
+        base_ip = cidr
+        prefix = 32
+
+    parts = list(map(int, base_ip.split('.')))
+    if len(parts) != 4:
+        raise ValueError(f"Invalid CIDR: {cidr}")
+
+    ip_long = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+    host_bits = 32 - prefix
+    mask = (1 << host_bits) - 1
+    random_host = random.randint(0, mask)
+    final_ip_long = (ip_long & ~mask) | random_host
+
+    p1 = (final_ip_long >> 24) & 255
+    p2 = (final_ip_long >> 16) & 255
+    p3 = (final_ip_long >> 8) & 255
+    p4 = final_ip_long & 255
+    return f"{p1}.{p2}.{p3}.{p4}"
+
+
+def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
+    """
+    按权重从三档候选池里抽一个网段，再在网段内随机生成一个IP：
+    60% 历史/24热点段 / 25% 历史/16热点段 / 15% 全量CF段。
+    抽样时会主动跳过"全局配额已满"的热点网段，避免生成注定会在筛选阶段被
+    丢弃的候选，节省测速请求。
+    """
+    for _ in range(20):  # 避免极端情况死循环，最多重试20次
+        try:
+            roll = random.random()
+
+            if roll < HOT_24_WEIGHT and hot_24_cidrs:
+                pool = [c for c in hot_24_cidrs if not _is_cidr_full(c)]
+                cidr = random.choice(pool) if pool else random.choice(all_cidrs)
+            elif roll < HOT_24_WEIGHT + HOT_16_WEIGHT and hot_16_cidrs:
+                pool = [c for c in hot_16_cidrs if not _is_cidr_full(c)]
+                cidr = random.choice(pool) if pool else random.choice(all_cidrs)
             else:
-                cidr = random.choice(CF_CIDRS)
-                
-            if '/' in cidr:
-                base_ip, prefix = cidr.split('/')
-                prefix = int(prefix)
-            else:
-                base_ip = cidr
-                prefix = 32
-            
-            parts = list(map(int, base_ip.split('.')))
-            if len(parts) != 4:
-                continue
-                
-            ip_long = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
-            
-            host_bits = 32 - prefix
-            mask = (1 << host_bits) - 1
-            random_host = random.randint(0, mask)
-            
-            final_ip_long = (ip_long & ~mask) | random_host
-            
-            p1 = (final_ip_long >> 24) & 255
-            p2 = (final_ip_long >> 16) & 255
-            p3 = (final_ip_long >> 8) & 255
-            p4 = final_ip_long & 255
-            
-            return f"{p1}.{p2}.{p3}.{p4}"
+                cidr = random.choice(all_cidrs)
+
+            return _random_ip_from_cidr(cidr)
         except Exception:
             continue
-            
-    return "1.1.1.1" # 兜底返回，防止崩溃
+
+    return "1.1.1.1"  # 兜底返回，防止崩溃
+
 
 def test_ip(ip, check_api_url, timeout=5.0):
     start_time = time.time()
     try:
         url = f"{check_api_url}?proxyip={ip}"
-        
         resp = requests.get(url, timeout=timeout).json()
         if resp.get("success") is True:
             connect_time = int((time.time() - start_time) * 1000)
-            
-            # 提取数据中心 (dataCenter)、colo 或 country，优先用 dataCenter
             colo = resp.get("dataCenter") or resp.get("colo") or resp.get("country") or "UNK"
-            
-            # 如果 API 返回了 latencyMs 或者 latency，优先用 API 测算的延迟，否则用整个请求的耗时
             latency = resp.get("latencyMs") or resp.get("tcpDuration") or connect_time
-            
             return {"ip": ip, "latency": latency, "colo": colo}
     except Exception:
         pass
     return None
 
-def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email):
+
+def select_diverse_ips(sorted_ips, limit, max_per_subnet=MAX_PER_SUBNET):
+    """
+    从按延迟排好序的IP列表里挑最终名单：
+    同一个 /16、同一个 /24 网段最多各选 max_per_subnet 个，两层限制都要满足。
+    延迟优先，遇到超额的网段直接跳过，继续看下一个延迟稍高、但网段不同的IP。
+    """
+    selected = []
+    count24, count16 = {}, {}
+    for item in sorted_ips:
+        parts = item["ip"].split(".")
+        key24 = ".".join(parts[:3])
+        key16 = ".".join(parts[:2])
+        if count24.get(key24, 0) >= max_per_subnet:
+            continue
+        if count16.get(key16, 0) >= max_per_subnet:
+            continue
+        selected.append(item)
+        count24[key24] = count24.get(key24, 0) + 1
+        count16[key16] = count16.get(key16, 0) + 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, allow_delete=True):
     headers = {
         "X-Auth-Email": cf_email,
         "X-Auth-Key": api_token,
         "Content-Type": "application/json"
     }
     url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={target_domain}"
-    
+
     print(f"Fetching existing DNS records for {target_domain}...")
     try:
         resp = requests.get(url, headers=headers).json()
         if not resp.get("success"):
             print("Failed to fetch DNS records:", resp)
             return False
-        
+
         existing_records = resp.get("result", [])
         existing_map = {r["content"]: r["id"] for r in existing_records}
         desired_ips = [ip["ip"] for ip in best_ips]
-        
-        # 1. Delete records that are no longer in our best_ips list
-        for ip_val, record_id in existing_map.items():
-            if ip_val not in desired_ips:
-                print(f"Deleting outdated IP: {ip_val}")
-                del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-                requests.delete(del_url, headers=headers)
-                
-        # 2. Add new IPs
+
+        # 1. 删除不再需要的旧记录（仅在 allow_delete=True 时执行）
+        if allow_delete:
+            for ip_val, record_id in existing_map.items():
+                if ip_val not in desired_ips:
+                    print(f"Deleting outdated IP: {ip_val}")
+                    del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+                    requests.delete(del_url, headers=headers)
+        else:
+            print("本次筛选数量不足 sync_count，跳过删除旧记录（避免收窄到同一网段），仅追加新IP。")
+
+        # 2. 追加新IP（不管 allow_delete 与否，新IP都正常添加）
         for ip_val in desired_ips:
             if ip_val not in existing_map:
                 print(f"Adding new IP: {ip_val}")
@@ -144,172 +256,199 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email):
                     "proxied": False
                 }
                 requests.post(post_url, headers=headers, json=data)
-                
+
         print("Cloudflare DNS Sync completed successfully!")
         return True
     except Exception as e:
         print(f"Exception during Cloudflare sync: {e}")
         return False
 
-def save_ips_to_file(best_ips):
-    # Calculate Beijing Time (UTC+8)
-    bj_time = datetime.now(timezone.utc) + timedelta(hours=8)
-    time_str = bj_time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    with open("ips-v4.txt", "w", encoding="utf-8") as f:
-        # 写入纯 IP 和 地区备注，格式为 IP#地区
-        # 很多代理/机场客户端使用 # 作为节点备注的分隔符
-        for ip in best_ips:
-            f.write(f"{ip['ip']}#{ip['colo']}\n")
-            
-    print("Successfully saved latest IPs to ips-v4.txt")
+
+def save_ips_to_file(new_best_ips, file_path="ips-v4.txt"):
+    """
+    合并写入，而不是覆盖写入：
+    读出文件里已有的历史IP，和这次新选出的 best_ips 合并（同一个IP以本次结果刷新
+    地区备注，历史IP永久保留、不会因为这次运行就消失），再整体写回。
+    """
+    existing = {}  # ip -> colo
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if "#" in line:
+                        ip_part, colo_part = line.split("#", 1)
+                    else:
+                        ip_part, colo_part = line, "UNK"
+                    existing[ip_part.strip()] = colo_part.strip()
+        except Exception as e:
+            print(f"Warning: 读取历史 {file_path} 失败，将只写入本次结果: {e}")
+
+    before_count = len(existing)
+    for item in new_best_ips:
+        existing[item["ip"]] = item["colo"]
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        for ip, colo in existing.items():
+            f.write(f"{ip}#{colo}\n")
+
+    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(existing)} total (history preserved).")
+
+
+def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit):
+    """
+    流式扫描：线程池维持恒定并发(CONCURRENCY)，每完成一个测速请求就立刻检查一次状态，
+    决定是否需要补一个新任务进去，不再有"轮次/批次"的概念。
+
+    停止条件（满足任一即停）：
+      1. 每个目标地区都凑够了 sync_count 个原始命中（ALL模式下是全局凑够 all_mode_limit 个）
+      2. 累计发起的测速请求总数达到 TOTAL_REQUEST_LIMIT 硬上限
+    """
+    valid_ips_by_region = {} if is_scan_all else {r: [] for r in target_regions}
+    total_submitted = 0
+    submit_lock = threading.Lock()
+
+    def is_done():
+        if is_scan_all:
+            return sum(len(v) for v in valid_ips_by_region.values()) >= all_mode_limit
+        return all(len(valid_ips_by_region.get(r, [])) >= sync_count for r in target_regions)
+
+    def try_submit(executor):
+        nonlocal total_submitted
+        with submit_lock:
+            if total_submitted >= TOTAL_REQUEST_LIMIT:
+                return None
+            total_submitted += 1
+        ip = generate_random_ip(hot_24, hot_16, all_cidrs)
+        return executor.submit(test_ip, ip, check_api_url)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+        pending = set()
+        for _ in range(CONCURRENCY):
+            fut = try_submit(executor)
+            if fut:
+                pending.add(fut)
+
+        while pending:
+            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+
+            for fut in done:
+                result = fut.result()
+                if result:
+                    ip = result["ip"]
+                    colo = result.get("colo", "UNK").upper()
+                    if colo != "UNK" and (is_scan_all or colo in target_regions):
+                        bucket = valid_ips_by_region.setdefault(colo, [])
+                        if is_scan_all:
+                            total_now = sum(len(v) for v in valid_ips_by_region.values())
+                            if total_now < all_mode_limit:
+                                bucket.append(result)
+                                _record_valid_ip(ip)
+                                print(f"[FOUND {colo}] {ip} (Total ALL: {total_now + 1}/{all_mode_limit})")
+                        else:
+                            if len(bucket) < sync_count:
+                                bucket.append(result)
+                                _record_valid_ip(ip)
+                                print(f"[FOUND {colo}] {ip} (Total {colo}: {len(bucket)}/{sync_count})")
+
+            if is_done() or total_submitted >= TOTAL_REQUEST_LIMIT:
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+
+            # 补齐并发槽位
+            slots = CONCURRENCY - len(pending)
+            for _ in range(max(slots, 0)):
+                fut = try_submit(executor)
+                if fut is None:
+                    break
+                pending.add(fut)
+
+    print(f"\n本次扫描共发起 {total_submitted} 次测速请求（硬上限 {TOTAL_REQUEST_LIMIT}）。")
+    return valid_ips_by_region, total_submitted
+
 
 def main():
     api_token = os.environ.get("CF_API_TOKEN")
     zone_id = os.environ.get("CF_ZONE_ID")
     base_domain = os.environ.get("CF_TARGET_DOMAIN")
     cf_email = os.environ.get("CF_EMAIL")
-    
+
     region_input = DEFAULT_REGIONS
     target_regions = [r.strip().upper() for r in region_input.split(",") if r.strip()]
     is_scan_all = "ALL" in target_regions
-    
+
     if is_scan_all:
         print(f"Target Regions dynamically set to: ALL (Global Scan Mode)")
     else:
         print(f"Target Regions dynamically set to: {target_regions}")
-    
+
     check_api_url = os.environ.get("CHECK_API_URL")
     sync_count = SYNC_COUNT
-    scan_count = SCAN_COUNT
-    
-    # === 从 ips-v4.txt 中提取历史优秀 IP 段 (/24) ===
-    hot_cidrs = []
-    if os.path.exists("ips-v4.txt"):
-        try:
-            with open("ips-v4.txt", "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        ip_str = line.split("#")[0]
-                        parts = ip_str.split(".")
-                        if len(parts) == 4:
-                            hot_cidrs.append(f"{parts[0]}.{parts[1]}.{parts[2]}.0/24")
-            hot_cidrs = list(set(hot_cidrs))
-            print(f"Loaded {len(hot_cidrs)} hot /24 subnets from ips-v4.txt for targeted scanning.")
-        except Exception as e:
-            pass
-    
+
+    # === 加载历史热点网段(/24 + /16 两档) ===
+    hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
+    print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
+
     can_sync = True
     if not all([api_token, zone_id, base_domain, cf_email]):
         print("Warning: Missing required environment variables (CF_API_TOKEN, CF_ZONE_ID, CF_TARGET_DOMAIN, CF_EMAIL).")
         print("DNS Synchronization will be skipped, but IP scanning will still proceed!")
         can_sync = False
-        
-    print(f"Generating {scan_count} random Cloudflare IPs...")
-    ips_to_test = [generate_random_ip(hot_cidrs) for _ in range(scan_count)]
-    
-    print(f"Testing IPs concurrently via {check_api_url}...")
-    
-    valid_ips_by_region = {}
-    if not is_scan_all:
-        valid_ips_by_region = {region: [] for region in target_regions}
-    
-    # We will loop scanning until we find enough IPs for all regions, or hit max attempts.
-    max_attempts = 10
-    attempt = 0
-    ALL_MODE_LIMIT = 20
-    
-    while attempt < max_attempts:
-        # Check if we hit our target sync count for ALL target regions
-        total_collected = sum(len(ips) for ips in valid_ips_by_region.values())
-        if is_scan_all and total_collected >= ALL_MODE_LIMIT:
-            break
-        elif not is_scan_all and all(len(ips) >= sync_count for ips in valid_ips_by_region.values()):
-            break
-            
-        attempt += 1
-        print(f"--- Scan Iteration {attempt} ---")
-        ips_to_test = [generate_random_ip(hot_cidrs) for _ in range(scan_count)]
-        
-        # === 并发线程配置区 ===
-        # 控制同时发起多少个测速请求，默认 50，太高容易导致测速接口崩溃
-        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-            futures = {executor.submit(test_ip, ip, check_api_url): ip for ip in ips_to_test}
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result:
-                    colo = result.get('colo', 'UNK').upper()
-                    if colo != 'UNK' and (is_scan_all or colo in target_regions):
-                        if colo not in valid_ips_by_region:
-                            valid_ips_by_region[colo] = []
-                            
-                        if is_scan_all:
-                            total_collected = sum(len(ips) for ips in valid_ips_by_region.values())
-                            if total_collected < ALL_MODE_LIMIT:
-                                valid_ips_by_region[colo].append(result)
-                                print(f"[FOUND {colo}] {result['ip']} (Total ALL: {total_collected + 1}/{ALL_MODE_LIMIT})")
-                        else:
-                            if len(valid_ips_by_region[colo]) < sync_count:
-                                valid_ips_by_region[colo].append(result)
-                                print(f"[FOUND {colo}] {result['ip']} (Total {colo}: {len(valid_ips_by_region[colo])}/{sync_count})")
-                        
-                # Early exit check
-                total_collected = sum(len(ips) for ips in valid_ips_by_region.values())
-                if is_scan_all and total_collected >= ALL_MODE_LIMIT:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                elif not is_scan_all and all(len(ips) >= sync_count for ips in valid_ips_by_region.values()):
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
-                    
+
+    print(f"Starting streaming scan (concurrency={CONCURRENCY}, total request cap={TOTAL_REQUEST_LIMIT})...")
+    valid_ips_by_region, total_submitted = scan_stream(
+        hot_24, hot_16, CF_CIDRS, check_api_url,
+        target_regions, is_scan_all, sync_count, ALL_MODE_LIMIT
+    )
+
     print("\nScan completed. Summary:")
     total_found = 0
     all_best_ips = []
-    
+
     for region, ips in valid_ips_by_region.items():
         print(f"- {region}: {len(ips)} valid IPs found")
         if not ips:
             print(f"  Warning: No IPs found for {region}")
             continue
-            
+
         total_found += len(ips)
-        
-        # Sort by latency (lowest first)
         ips.sort(key=lambda x: x["latency"])
-        
-        # Take the top fastest ones
+
         limit = ALL_MODE_LIMIT if is_scan_all else sync_count
-        best_ips = ips[:limit]
+        best_ips = select_diverse_ips(ips, limit)
         all_best_ips.extend(best_ips)
-        
-        print(f"\n--- Top {len(best_ips)} IPs Selected for {region} ---")
+
+        print(f"\n--- Top {len(best_ips)} Diversity-Limited IPs Selected for {region} ---")
         for ip in best_ips:
             print(f"IP: {ip['ip']:<15} | Latency: {ip['latency']:>3}ms | Colo: {ip['colo']}")
-            
-        # Target domain specific to this region
+
         if can_sync:
             target_domain = f"{region.lower()}.{base_domain}"
+            allow_delete = len(best_ips) >= sync_count
+            if not allow_delete:
+                print(f"注意: {region} 本次仅选出 {len(best_ips)}/{sync_count} 个(原始命中不足或受网段多样性限制)，跳过删除旧记录，只追加新IP。")
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
-            sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email)
+            sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, allow_delete=allow_delete)
         else:
             print(f"\nSkipping Cloudflare DNS Sync for {region} (Missing Credentials).")
-                
+
     if can_sync and all_best_ips:
         if SYNC_MAIN_DOMAIN.strip().upper() == "YES":
             all_best_ips.sort(key=lambda x: x["latency"])
             print(f"\n[Global Sync] Starting Cloudflare DNS Sync for MAIN DOMAIN: {base_domain}")
-            sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email)
+            sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, allow_delete=True)
         else:
             print(f"\n[Global Sync] Skipped synchronizing to MAIN DOMAIN ({base_domain}) because SYNC_MAIN_DOMAIN is set to NO.")
 
     if total_found == 0:
         print("No valid IPs found in this scan across any regions. Aborting.")
         exit(1)
-        
-    # Save ALL best IPs from all regions to the text file for next run's subnet learning
+
     if all_best_ips:
         save_ips_to_file(all_best_ips)
+
 
 if __name__ == "__main__":
     main()
