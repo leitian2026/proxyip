@@ -154,7 +154,7 @@ def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
     抽样时会主动跳过"全局配额已满"的热点 /24 网段，避免生成注定会在筛选阶段被
     丢弃的候选，节省测速请求；/16 本身不受2个限制。
     """
-    for _ in range(20):  # 避免极端情况死循环，最多重试20次
+    for _ in range(20):
         try:
             roll = random.random()
 
@@ -162,7 +162,6 @@ def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
                 pool = [c for c in hot_24_cidrs if not _is_cidr_full(c)]
                 cidr = random.choice(pool) if pool else random.choice(all_cidrs)
             elif roll < HOT_24_WEIGHT + HOT_16_WEIGHT and hot_16_cidrs:
-                # /16 包含大量不同 /24，不能因为其中一个 /24 满了就跳过整个 /16
                 cidr = random.choice(hot_16_cidrs)
             else:
                 cidr = random.choice(all_cidrs)
@@ -171,7 +170,7 @@ def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
         except Exception:
             continue
 
-    return "1.1.1.1"  # 兜底返回，防止崩溃
+    return "1.1.1.1"
 
 
 def test_ip(ip, check_api_url, timeout=5.0):
@@ -215,9 +214,6 @@ def select_diverse_merged(new_items, existing_ips, target_count, max_per_subnet=
     把"本次新测出的结果"(new_items，需已按延迟从低到高排序，优先级更高)
     和 "Cloudflare上现有的旧记录"(existing_ips，纯IP字符串，优先级较低)放在一起，
     按前三段(A.B.C)配额选出最终名单：每个 /24 最多 max_per_subnet 个，前两段不限制。
-
-    网段配额被占满时，不管候选是新是旧都会被跳过——因为新结果排在前面优先占位，
-    实际效果是"同一 /24"的旧记录会被优先挤掉，总数也会稳定收敛在 target_count 附近。
     """
     new_ip_order = [item["ip"] for item in new_items]
     new_ip_set = set(new_ip_order)
@@ -258,18 +254,15 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         existing_map = {r["content"]: r["id"] for r in existing_records}
         existing_ips = list(existing_map.keys())
 
-        # best_ips 已经按延迟排好序（调用方保证），跟CF上现有记录合并后重新选出最终名单
         final_ips = select_diverse_merged(best_ips, existing_ips, target_count=sync_count, max_per_subnet=max_per_subnet)
         final_set = set(final_ips)
 
-        # 1. 删除不在最终名单里的旧记录（可能是过期的，也可能是网段配额被挤掉的重复项）
         for ip_val, record_id in existing_map.items():
             if ip_val not in final_set:
                 print(f"Deleting outdated/over-quota IP: {ip_val}")
                 del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
                 requests.delete(del_url, headers=headers)
 
-        # 2. 追加最终名单里CF上还没有的新IP
         for ip_val in final_ips:
             if ip_val not in existing_map:
                 print(f"Adding new IP: {ip_val}")
@@ -278,7 +271,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                     "type": "A",
                     "name": target_domain,
                     "content": ip_val,
-                    "ttl": 60,  # Auto/1 minute
+                    "ttl": 60,
                     "proxied": False
                 }
                 requests.post(post_url, headers=headers, json=data)
@@ -296,7 +289,7 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     ips-v4.txt 同样遵守网段多样性限制：相同前三段(A.B.C)最多保留2个，前两段不限制。
     同一个IP以本次结果刷新地区备注；历史文件中已经超过限制的旧IP也会被清理。
     """
-    existing = {}  # ip -> colo
+    existing = {}
     if os.path.exists(file_path):
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -314,7 +307,6 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
 
     before_count = len(existing)
 
-    # 本次新结果按延迟从低到高排序，延迟低的优先占用 /24 配额
     new_sorted = sorted(new_best_ips, key=lambda x: x["latency"])
     new_ip_order = []
     new_ip_set = set()
@@ -335,7 +327,6 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         count24[key24] = count24.get(key24, 0) + 1
         existing[ip] = item["colo"]
 
-    # 历史IP也继续遵守 /24 最多2个；新结果优先，历史条目抢不到配额的会被清理
     kept = list(new_ip_order)
     kept_set = set(kept)
 
@@ -351,6 +342,9 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         kept.append(ip)
         kept_set.add(ip)
         count24[key24] = count24.get(key24, 0) + 1
+
+    # 按前三段分组排序：同一个 /24 的IP连续放在一起；/24之间按数字顺序排列
+    kept.sort(key=lambda ip: tuple(map(int, ip.split("."))))
 
     with open(file_path, "w", encoding="utf-8") as f:
         for ip in kept:
@@ -419,7 +413,6 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
 
-            # 补齐并发槽位
             slots = CONCURRENCY - len(pending)
             for _ in range(max(slots, 0)):
                 fut = try_submit(executor)
@@ -449,7 +442,6 @@ def main():
     check_api_url = os.environ.get("CHECK_API_URL")
     sync_count = SYNC_COUNT
 
-    # === 加载历史热点网段(/24 + /16 两档) ===
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
     print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
 
