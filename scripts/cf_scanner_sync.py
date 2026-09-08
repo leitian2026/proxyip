@@ -23,8 +23,8 @@ SYNC_COUNT = 10       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
 
 # === 网段多样性设置 ===
-# 最终筛选时，同一个 /16、同一个 /24 网段最多各能入选几个 IP（两层都要满足）
-# 避免最终同步出去的 IP 全部挤在同一网段（同一条线路/同一机房），起不到冗余作用
+# 最终筛选时：1.2.x.x 不设限制；其他相同前两段(A.B)的IP最多各入选2个
+# 避免最终同步出去的 IP 全部挤在同一前两段网段（同一条线路/同一机房），起不到冗余作用
 MAX_PER_SUBNET = 2
 
 # === 扫描资源上限设置（取代原来的 SCAN_COUNT / max_attempts 轮次概念）===
@@ -67,7 +67,7 @@ CF_CIDRS = load_cf_cidrs()
 
 # === 全局网段配额计数 ===
 # 用于生成阶段实时排除"已经测满的网段"，避免浪费请求。
-# 采用全局口径：不区分地区(colo)，只要这个网段全局已经收集到 MAX_PER_SUBNET 个
+# 采用全局口径：不区分地区(colo)，只要这个前两段网段全局已经收集到 MAX_PER_SUBNET 个
 # 被实际采纳的有效IP，后续生成候选IP时就主动跳过这个网段。
 _subnet_lock = threading.Lock()
 _subnet24_count = {}
@@ -75,31 +75,34 @@ _subnet16_count = {}
 
 
 def _is_cidr_full(cidr):
-    """判断一个 /24 或 /16 的 CIDR 网段是否已经达到全局配额上限"""
+    """判断一个网段是否已经达到全局配额上限；1.2.x.x 永不视为已满。"""
     try:
         base, prefix = cidr.split("/")
         prefix = int(prefix)
     except Exception:
         return False
     parts = base.split(".")
+    if len(parts) < 2:
+        return False
+    # 1.2.x.x 特殊放开，不受任何网段配额限制
+    if parts[0] == "1" and parts[1] == "2":
+        return False
     with _subnet_lock:
-        if prefix == 24:
-            key = ".".join(parts[:3])
-            return _subnet24_count.get(key, 0) >= MAX_PER_SUBNET
-        elif prefix == 16:
-            key = ".".join(parts[:2])
-            return _subnet16_count.get(key, 0) >= MAX_PER_SUBNET
-    return False
+        key_ab = ".".join(parts[:2])
+        return _subnet16_count.get(key_ab, 0) >= MAX_PER_SUBNET
 
 
 def _record_valid_ip(ip):
-    """一个IP被实际采纳进某地区候选池时调用，更新全局网段配额计数"""
+    """一个IP被实际采纳进某地区候选池时调用，更新全局网段配额计数；1.2.x.x 不计入配额。"""
     parts = ip.split(".")
-    key24 = ".".join(parts[:3])
-    key16 = ".".join(parts[:2])
+    if len(parts) != 4:
+        return
+    # 1.2.x.x 特殊放开，不参与任何配额计数
+    if parts[0] == "1" and parts[1] == "2":
+        return
+    key_ab = ".".join(parts[:2])
     with _subnet_lock:
-        _subnet24_count[key24] = _subnet24_count.get(key24, 0) + 1
-        _subnet16_count[key16] = _subnet16_count.get(key16, 0) + 1
+        _subnet16_count[key_ab] = _subnet16_count.get(key_ab, 0) + 1
 
 
 def load_hot_subnets(file_path="ips-v4.txt"):
@@ -193,22 +196,22 @@ def test_ip(ip, check_api_url, timeout=5.0):
 def select_diverse_ips(sorted_ips, limit, max_per_subnet=MAX_PER_SUBNET):
     """
     从按延迟排好序的IP列表里挑最终名单：
-    同一个 /16、同一个 /24 网段最多各选 max_per_subnet 个，两层限制都要满足。
-    延迟优先，遇到超额的网段直接跳过，继续看下一个延迟稍高、但网段不同的IP。
+    1.2.x.x 不受限制；其他相同前两段(A.B)的IP最多选 max_per_subnet 个。
     """
     selected = []
-    count24, count16 = {}, {}
+    count_ab = {}
     for item in sorted_ips:
         parts = item["ip"].split(".")
-        key24 = ".".join(parts[:3])
-        key16 = ".".join(parts[:2])
-        if count24.get(key24, 0) >= max_per_subnet:
+        if len(parts) != 4:
             continue
-        if count16.get(key16, 0) >= max_per_subnet:
-            continue
-        selected.append(item)
-        count24[key24] = count24.get(key24, 0) + 1
-        count16[key16] = count16.get(key16, 0) + 1
+        if parts[0] == "1" and parts[1] == "2":
+            selected.append(item)
+        else:
+            key_ab = ".".join(parts[:2])
+            if count_ab.get(key_ab, 0) >= max_per_subnet:
+                continue
+            selected.append(item)
+            count_ab[key_ab] = count_ab.get(key_ab, 0) + 1
         if len(selected) >= limit:
             break
     return selected
@@ -218,10 +221,10 @@ def select_diverse_merged(new_items, existing_ips, target_count, max_per_subnet=
     """
     把"本次新测出的结果"(new_items，需已按延迟从低到高排序，优先级更高)
     和 "Cloudflare上现有的旧记录"(existing_ips，纯IP字符串，优先级较低)放在一起，
-    按 /16、/24 网段配额(各最多 max_per_subnet 个)选出最终名单，总数不超过 target_count。
+    按前两段(A.B)配额选出最终名单：1.2.x.x 不限，其他A.B最多 max_per_subnet 个。
 
     网段配额被占满时，不管候选是新是旧都会被跳过——因为新结果排在前面优先占位，
-    实际效果是"网段里已经重复"的旧记录会被优先挤掉，总数也会稳定收敛在 target_count
+    实际效果是"前两段相同"的旧记录会被优先挤掉，总数也会稳定收敛在 target_count
     附近，不会因为"这次没测够"就无限累积。
     """
     new_ip_order = [item["ip"] for item in new_items]
@@ -229,16 +232,19 @@ def select_diverse_merged(new_items, existing_ips, target_count, max_per_subnet=
     ordered_ips = new_ip_order + [ip for ip in existing_ips if ip not in new_ip_set]
 
     kept = []
-    count24, count16 = {}, {}
+    count_ab = {}
     for ip in ordered_ips:
         parts = ip.split(".")
-        key24 = ".".join(parts[:3])
-        key16 = ".".join(parts[:2])
-        if count24.get(key24, 0) >= max_per_subnet or count16.get(key16, 0) >= max_per_subnet:
+        if len(parts) != 4:
             continue
-        kept.append(ip)
-        count24[key24] = count24.get(key24, 0) + 1
-        count16[key16] = count16.get(key16, 0) + 1
+        if parts[0] == "1" and parts[1] == "2":
+            kept.append(ip)
+        else:
+            key_ab = ".".join(parts[:2])
+            if count_ab.get(key_ab, 0) >= max_per_subnet:
+                continue
+            kept.append(ip)
+            count_ab[key_ab] = count_ab.get(key_ab, 0) + 1
         if len(kept) >= target_count:
             break
     return kept
@@ -333,25 +339,29 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     ordered_ips = new_ip_order + [ip for ip in existing if ip not in new_ip_set]
 
     kept = []
-    count24, count16 = {}, {}
+    count_ab = {}
     dropped = 0
     for ip in ordered_ips:
         parts = ip.split(".")
-        key24 = ".".join(parts[:3])
-        key16 = ".".join(parts[:2])
-        if count24.get(key24, 0) >= max_per_subnet or count16.get(key16, 0) >= max_per_subnet:
+        if len(parts) != 4:
             dropped += 1
             continue
-        kept.append(ip)
-        count24[key24] = count24.get(key24, 0) + 1
-        count16[key16] = count16.get(key16, 0) + 1
+        if parts[0] == "1" and parts[1] == "2":
+            kept.append(ip)
+        else:
+            key_ab = ".".join(parts[:2])
+            if count_ab.get(key_ab, 0) >= max_per_subnet:
+                dropped += 1
+                continue
+            kept.append(ip)
+            count_ab[key_ab] = count_ab.get(key_ab, 0) + 1
 
     with open(file_path, "w", encoding="utf-8") as f:
         for ip in kept:
             f.write(f"{ip}#{existing[ip]}\n")
 
     print(f"Merged IPs into {file_path}: {before_count} historical + this run -> "
-          f"{len(kept)} kept after /16+/24 dedup ({dropped} over-quota entries pruned, history not indefinitely growing).")
+          f"{len(kept)} kept after A.B dedup ({dropped} over-quota entries pruned, history not indefinitely growing).")
 
 
 def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit):
