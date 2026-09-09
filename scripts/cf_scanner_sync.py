@@ -4,7 +4,6 @@ import time
 import threading
 import requests
 import concurrent.futures
-from datetime import datetime, timedelta, timezone
 
 # ==========================================
 # 🎯 全局默认地区设置 (如果想要永久换地区，只改这里！)
@@ -24,7 +23,7 @@ ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
-# 最终筛选时：相同前三段(A.B.C)的IP最多入选2个；前两段相同不额外限制
+# 最终筛选时：相同前三段(A.B.C)的IP最多入选 MAX_PER_SUBNET 个（当前=1个）；前两段相同不额外限制
 # 避免最终同步出去的 IP 全部挤在同一个 /24 网段（同一条线路/同一机房），起不到冗余作用
 MAX_PER_SUBNET = 1
 
@@ -72,7 +71,6 @@ CF_CIDRS = load_cf_cidrs()
 # 被实际采纳的有效IP，后续生成候选IP时就主动跳过这个 /24 网段。
 _subnet_lock = threading.Lock()
 _subnet24_count = {}
-_subnet16_count = {}
 
 
 def _is_cidr_full(cidr):
@@ -151,7 +149,7 @@ def _random_ip_from_cidr(cidr):
 def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
     """
     按权重从三档候选池里抽一个网段，再在网段内随机生成一个IP：
-    40% 历史/24热点段 / 35% 历史/16热点段 / 25% 全量CF段。
+    HOT_24_WEIGHT(20%) 历史/24热点段 / HOT_16_WEIGHT(25%) 历史/16热点段 / 剩余55% 全量CF段。
     抽样时会主动跳过"全局配额已满"的热点 /24 网段，避免生成注定会在筛选阶段被
     丢弃的候选，节省测速请求；/16 本身不受2个限制。
     """
@@ -242,28 +240,51 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         "X-Auth-Key": api_token,
         "Content-Type": "application/json"
     }
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={target_domain}"
+    base_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={target_domain}&per_page=100"
 
     print(f"Fetching existing DNS records for {target_domain}...")
     try:
-        resp = requests.get(url, headers=headers).json()
-        if not resp.get("success"):
-            print("Failed to fetch DNS records:", resp)
-            return False
-
-        existing_records = resp.get("result", [])
-        existing_map = {r["content"]: r["id"] for r in existing_records}
-        existing_ips = list(existing_map.keys())
+        # 分页拉取，避免同一子域名记录数超过单页返回上限时漏掉部分记录
+        existing_records = []
+        page = 1
+        while True:
+            resp = requests.get(f"{base_url}&page={page}", headers=headers).json()
+            if not resp.get("success"):
+                print("Failed to fetch DNS records:", resp)
+                return False
+            existing_records.extend(resp.get("result", []))
+            total_pages = resp.get("result_info", {}).get("total_pages", 1)
+            if page >= total_pages:
+                break
+            page += 1
+        # 同时记录每条记录的创建时间，用于"新IP不够数时，优先淘汰最旧的现有记录"
+        existing_map = {
+            r["content"]: {"id": r["id"], "created_on": r.get("created_on", "")}
+            for r in existing_records
+        }
+        # 按创建时间从新到旧排序：合并时新扫描结果始终优先占位，
+        # 现有记录按"最新的先补位"的顺序参与凑数，
+        # 这样一旦总数超过 sync_count 名额，被挤掉（删除）的必然是创建时间最早的那些。
+        existing_ips = sorted(
+            existing_map.keys(),
+            key=lambda ip: existing_map[ip]["created_on"],
+            reverse=True,
+        )
 
         final_ips = select_diverse_merged(best_ips, existing_ips, target_count=sync_count, max_per_subnet=max_per_subnet)
         final_set = set(final_ips)
 
-        for ip_val, record_id in existing_map.items():
+        delete_failures = []
+        for ip_val, info in existing_map.items():
             if ip_val not in final_set:
-                print(f"Deleting outdated/over-quota IP: {ip_val}")
-                del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-                requests.delete(del_url, headers=headers)
+                print(f"Deleting outdated/over-quota IP: {ip_val} (created_on={info['created_on']})")
+                del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{info['id']}"
+                del_resp = requests.delete(del_url, headers=headers).json()
+                if not del_resp.get("success"):
+                    print(f"  Warning: 删除 {ip_val} 失败: {del_resp.get('errors')}")
+                    delete_failures.append(ip_val)
 
+        add_failures = []
         for ip_val in final_ips:
             if ip_val not in existing_map:
                 print(f"Adding new IP: {ip_val}")
@@ -275,7 +296,14 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                     "ttl": 60,
                     "proxied": False
                 }
-                requests.post(post_url, headers=headers, json=data)
+                post_resp = requests.post(post_url, headers=headers, json=data).json()
+                if not post_resp.get("success"):
+                    print(f"  Warning: 添加 {ip_val} 失败: {post_resp.get('errors')}")
+                    add_failures.append(ip_val)
+
+        if delete_failures or add_failures:
+            print(f"Cloudflare DNS Sync完成，但部分操作失败！删除失败: {delete_failures or '无'}；添加失败: {add_failures or '无'}")
+            return False
 
         print(f"Cloudflare DNS Sync completed successfully! ({len(final_ips)}/{sync_count} records)")
         return True
@@ -287,7 +315,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
 def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET):
     """
     合并写入，而不是覆盖写入。
-    ips-v4.txt 同样遵守网段多样性限制：相同前三段(A.B.C)最多保留2个，前两段不限制。
+    ips-v4.txt 同样遵守网段多样性限制：相同前三段(A.B.C)最多保留 max_per_subnet 个（当前=1个），前两段不限制。
     同一个IP以本次结果刷新地区备注；历史文件中已经超过限制的旧IP也会被清理。
     """
     existing = {}
@@ -444,6 +472,9 @@ def main():
         print(f"Target Regions dynamically set to: {target_regions}")
 
     check_api_url = os.environ.get("CHECK_API_URL")
+    if not check_api_url:
+        print("Error: 未设置环境变量 CHECK_API_URL（测速检测接口地址），扫描无法进行，直接退出。")
+        exit(1)
     sync_count = SYNC_COUNT
 
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
