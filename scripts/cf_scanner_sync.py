@@ -21,6 +21,7 @@ SYNC_MAIN_DOMAIN = "NO"
 # 🎯 扫描与同步数量设置
 SYNC_COUNT = 10       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
+MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
 # 最终筛选时：相同前三段(A.B.C)的IP最多入选2个；前两段相同不额外限制
@@ -343,6 +344,9 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         kept_set.add(ip)
         count24[key24] = count24.get(key24, 0) + 1
 
+    # 限制 ips-v4.txt 总数量：本次新结果优先，历史IP仅用于补足剩余名额
+    kept = kept[:MAX_IPS_FILE]
+
     # 按前三段分组排序：同一个 /24 的IP连续放在一起；/24之间按数字顺序排列
     kept.sort(key=lambda ip: tuple(map(int, ip.split("."))))
 
@@ -350,7 +354,7 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         for ip in kept:
             f.write(f"{ip}#{existing[ip]}\n")
 
-    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24).")
+    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
 
 
 def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit):
