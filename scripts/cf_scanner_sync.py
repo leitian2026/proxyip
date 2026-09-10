@@ -4,6 +4,7 @@ import time
 import threading
 import requests
 import concurrent.futures
+from datetime import datetime
 
 # ==========================================
 # 🎯 全局默认地区设置 (如果想要永久换地区，只改这里！)
@@ -234,6 +235,32 @@ def select_diverse_merged(new_items, existing_ips, target_count, max_per_subnet=
     return kept
 
 
+def _parse_cf_datetime(ts):
+    """
+    把 Cloudflare 返回的 created_on 时间戳（形如 "2014-01-01T05:20:00.12345Z"，
+    小数位数不一定固定，理论上也可能没有小数部分）解析成真正的 datetime 对象，
+    用于按时间先后比较，而不是依赖字符串直接比大小（字符串比较在小数位数不一致、
+    或某条记录恰好没有小数部分时可能得出错误的先后顺序）。
+    解析失败时返回 datetime.min，保证排序仍能正常进行，不会因为个别记录时间戳
+    格式异常就让整个同步流程崩掉。
+    """
+    if not ts:
+        return datetime.min
+    ts = ts.strip()
+    if ts.endswith("Z"):
+        ts = ts[:-1]
+    if "." in ts:
+        main_part, frac_part = ts.split(".", 1)
+        frac_part = (frac_part + "000000")[:6]  # 补齐/截断到微秒精度(6位)
+    else:
+        main_part, frac_part = ts, "000000"
+    try:
+        dt = datetime.strptime(main_part, "%Y-%m-%dT%H:%M:%S")
+        return dt.replace(microsecond=int(frac_part))
+    except (ValueError, TypeError):
+        return datetime.min
+
+
 def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count, max_per_subnet=MAX_PER_SUBNET):
     headers = {
         "X-Auth-Email": cf_email,
@@ -265,9 +292,10 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         # 按创建时间从新到旧排序：合并时新扫描结果始终优先占位，
         # 现有记录按"最新的先补位"的顺序参与凑数，
         # 这样一旦总数超过 sync_count 名额，被挤掉（删除）的必然是创建时间最早的那些。
+        # 用 _parse_cf_datetime 解析成真正的 datetime 再比较，不依赖字符串格式的巧合。
         existing_ips = sorted(
             existing_map.keys(),
-            key=lambda ip: existing_map[ip]["created_on"],
+            key=lambda ip: _parse_cf_datetime(existing_map[ip]["created_on"]),
             reverse=True,
         )
 
