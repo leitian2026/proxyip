@@ -17,7 +17,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "aa"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -361,17 +361,22 @@ SUBDOMAIN_PREFIX_STATE_FILE = "subdomain_prefix.state"
 
 def load_last_subdomain_prefix(file_path=SUBDOMAIN_PREFIX_STATE_FILE):
     """
-    读取上一次实际生效的 SUBDOMAIN_PREFIX。文件不存在（比如第一次跑，或者这个功能
-    刚加上还没跑过）时返回 None，代表"没有历史记录可对比"，不触发对齐。
+    读取上一次实际生效的 SUBDOMAIN_PREFIX。
+    文件不存在时（比如前缀功能刚上线、还没成功跑过一次），说明历史上从来没有过"前缀"这个
+    概念，所有子域名此前一直都是无前缀的 region.base_domain 形式——这等价于"上次生效的
+    前缀是空字符串"，所以返回 "" 而不是 None。这样主流程才能正确识别出"这次配置的前缀"
+    和"历史上隐含的空前缀"不一样，从而触发一次性对齐，把旧的 region.base_domain 记录
+    改名搬到新的 prefix+region.base_domain 下，而不是误判成"无历史可比、不用对齐"。
+    读取文件出错时同样返回 ""，避免因为读取异常又退回"误判成无需对齐"的老问题。
     """
     if not os.path.exists(file_path):
-        return None
+        return ""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception as e:
         print(f"Warning: 读取前缀状态文件 {file_path} 失败: {e}")
-        return None
+        return ""
 
 
 def save_last_subdomain_prefix(prefix, file_path=SUBDOMAIN_PREFIX_STATE_FILE):
@@ -614,20 +619,18 @@ def main():
 
     # === SUBDOMAIN_PREFIX 一次性对齐 ===
     # 只在检测到"这次配置的前缀"和"上次实际生效的前缀"不一样时才触发，且只对齐一次：
-    # 对齐成功后会把新前缀写入状态文件，下次运行前缀没变就不会再重复对齐。
+    # 对齐后无论有没有触发改名，都会把当前前缀写入状态文件作为新基准，下次运行前缀没变就不会再重复对齐。
+    # load_last_subdomain_prefix() 在状态文件不存在时返回 ""（等价于"历史上一直是空前缀"），
+    # 而不是 None，所以这里不需要再单独处理"没有历史记录"的情况。
     if can_sync:
         last_prefix = load_last_subdomain_prefix()
-        if last_prefix is None:
-            # 没有历史记录（比如第一次跑，或者这个功能刚上线还没跑过），
-            # 无法判断是不是"改过"，直接把当前前缀存为基准，不做任何改名操作。
-            save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
-        elif last_prefix != SUBDOMAIN_PREFIX:
+        if last_prefix != SUBDOMAIN_PREFIX:
             print(f"\n检测到 SUBDOMAIN_PREFIX 从 \"{last_prefix}\" 改成了 \"{SUBDOMAIN_PREFIX}\"，开始一次性对齐DNS记录名称...")
             align_subdomain_prefix(
                 api_token, zone_id, base_domain, cf_email,
                 last_prefix, SUBDOMAIN_PREFIX, list(valid_ips_by_region.keys())
             )
-            save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
+        save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
     # can_sync 为 False 时（没配CF凭证）不做对齐，也不更新状态文件——
     # 这样等以后配置好凭证再跑，仍然能检测到这次的前缀变化并补做对齐。
 
