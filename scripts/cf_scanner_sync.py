@@ -13,6 +13,12 @@ from datetime import datetime
 # ==========================================
 DEFAULT_REGIONS = "SJC"
 
+# 🏷️ 地区子域名前缀（可选，默认留空不影响原来的命名）
+# 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
+# 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
+# 留空 "" 则和原来一样，就是 sjc.example.com
+SUBDOMAIN_PREFIX = ""
+
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
 # 设置为 "NO": 关闭！仅同步到各个地区子域名，不修改主域名的解析记录
@@ -261,29 +267,39 @@ def _parse_cf_datetime(ts):
         return datetime.min
 
 
+def _fetch_all_dns_records(zone_id, headers, name_filter, record_type="A"):
+    """
+    分页拉取指定 zone 下、指定 name(域名) + type 的全部DNS记录。
+    失败返回 None（调用方据此判断要不要中止）；正常情况返回记录列表（可能为空列表）。
+    """
+    records = []
+    page = 1
+    base_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={name_filter}&per_page=100"
+    while True:
+        resp = requests.get(f"{base_url}&page={page}", headers=headers).json()
+        if not resp.get("success"):
+            print(f"Failed to fetch DNS records for {name_filter}:", resp)
+            return None
+        records.extend(resp.get("result", []))
+        total_pages = resp.get("result_info", {}).get("total_pages", 1)
+        if page >= total_pages:
+            break
+        page += 1
+    return records
+
+
 def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count, max_per_subnet=MAX_PER_SUBNET):
     headers = {
         "X-Auth-Email": cf_email,
         "X-Auth-Key": api_token,
         "Content-Type": "application/json"
     }
-    base_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type=A&name={target_domain}&per_page=100"
 
     print(f"Fetching existing DNS records for {target_domain}...")
     try:
-        # 分页拉取，避免同一子域名记录数超过单页返回上限时漏掉部分记录
-        existing_records = []
-        page = 1
-        while True:
-            resp = requests.get(f"{base_url}&page={page}", headers=headers).json()
-            if not resp.get("success"):
-                print("Failed to fetch DNS records:", resp)
-                return False
-            existing_records.extend(resp.get("result", []))
-            total_pages = resp.get("result_info", {}).get("total_pages", 1)
-            if page >= total_pages:
-                break
-            page += 1
+        existing_records = _fetch_all_dns_records(zone_id, headers, target_domain)
+        if existing_records is None:
+            return False
         # 同时记录每条记录的创建时间，用于"新IP不够数时，优先淘汰最旧的现有记录"
         existing_map = {
             r["content"]: {"id": r["id"], "created_on": r.get("created_on", "")}
@@ -338,6 +354,78 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
     except Exception as e:
         print(f"Exception during Cloudflare sync: {e}")
         return False
+
+
+SUBDOMAIN_PREFIX_STATE_FILE = "subdomain_prefix.state"
+
+
+def load_last_subdomain_prefix(file_path=SUBDOMAIN_PREFIX_STATE_FILE):
+    """
+    读取上一次实际生效的 SUBDOMAIN_PREFIX。文件不存在（比如第一次跑，或者这个功能
+    刚加上还没跑过）时返回 None，代表"没有历史记录可对比"，不触发对齐。
+    """
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"Warning: 读取前缀状态文件 {file_path} 失败: {e}")
+        return None
+
+
+def save_last_subdomain_prefix(prefix, file_path=SUBDOMAIN_PREFIX_STATE_FILE):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(prefix)
+    except Exception as e:
+        print(f"Warning: 保存前缀状态文件 {file_path} 失败: {e}")
+
+
+def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix, new_prefix, regions):
+    """
+    SUBDOMAIN_PREFIX 发生变化后，一次性把"旧前缀子域名"下的DNS记录改名对齐到"新前缀子域名"，
+    只改 name 字段（域名），记录本身的 id / content(IP) / ttl / proxied 都不变，相当于把
+    整条记录从旧域名"搬"到新域名下，不会丢失已经积累的IP。
+
+    只处理传进来的 regions 列表覆盖到的地区——也就是这次运行实际扫描到结果的那些地区。
+    如果某个地区之前用旧前缀同步过，但这次运行的地区列表(DEFAULT_REGIONS)里已经不包含它了，
+    它名下旧前缀的子域名记录不会被这个函数处理到，需要自己去Cloudflare后台手动清理。
+    """
+    if old_prefix == new_prefix:
+        return
+
+    headers = {
+        "X-Auth-Email": cf_email,
+        "X-Auth-Key": api_token,
+        "Content-Type": "application/json"
+    }
+
+    for region in regions:
+        old_domain = f"{old_prefix}{region.lower()}.{base_domain}"
+        new_domain = f"{new_prefix}{region.lower()}.{base_domain}"
+        if old_domain == new_domain:
+            continue
+
+        old_records = _fetch_all_dns_records(zone_id, headers, old_domain)
+        if not old_records:
+            continue
+
+        print(f"[Prefix Align] 把 {old_domain} 的 {len(old_records)} 条记录对齐改名到 {new_domain} ...")
+        for r in old_records:
+            patch_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{r['id']}"
+            data = {
+                "type": r.get("type", "A"),
+                "name": new_domain,
+                "content": r.get("content"),
+                "ttl": r.get("ttl", 60),
+                "proxied": r.get("proxied", False),
+            }
+            patch_resp = requests.patch(patch_url, headers=headers, json=data).json()
+            if patch_resp.get("success"):
+                print(f"  已对齐: {r.get('content')}  {old_domain} -> {new_domain}")
+            else:
+                print(f"  Warning: 对齐失败 {r.get('content')} ({old_domain} -> {new_domain}): {patch_resp.get('errors')}")
 
 
 def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET):
@@ -524,6 +612,25 @@ def main():
     total_found = 0
     all_best_ips = []
 
+    # === SUBDOMAIN_PREFIX 一次性对齐 ===
+    # 只在检测到"这次配置的前缀"和"上次实际生效的前缀"不一样时才触发，且只对齐一次：
+    # 对齐成功后会把新前缀写入状态文件，下次运行前缀没变就不会再重复对齐。
+    if can_sync:
+        last_prefix = load_last_subdomain_prefix()
+        if last_prefix is None:
+            # 没有历史记录（比如第一次跑，或者这个功能刚上线还没跑过），
+            # 无法判断是不是"改过"，直接把当前前缀存为基准，不做任何改名操作。
+            save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
+        elif last_prefix != SUBDOMAIN_PREFIX:
+            print(f"\n检测到 SUBDOMAIN_PREFIX 从 \"{last_prefix}\" 改成了 \"{SUBDOMAIN_PREFIX}\"，开始一次性对齐DNS记录名称...")
+            align_subdomain_prefix(
+                api_token, zone_id, base_domain, cf_email,
+                last_prefix, SUBDOMAIN_PREFIX, list(valid_ips_by_region.keys())
+            )
+            save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
+    # can_sync 为 False 时（没配CF凭证）不做对齐，也不更新状态文件——
+    # 这样等以后配置好凭证再跑，仍然能检测到这次的前缀变化并补做对齐。
+
     for region, ips in valid_ips_by_region.items():
         print(f"- {region}: {len(ips)} valid IPs found")
         if not ips:
@@ -542,7 +649,7 @@ def main():
             print(f"IP: {ip['ip']:<15} | Latency: {ip['latency']:>3}ms | Colo: {ip['colo']}")
 
         if can_sync:
-            target_domain = f"{region.lower()}.{base_domain}"
+            target_domain = f"{SUBDOMAIN_PREFIX}{region.lower()}.{base_domain}"
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
             sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
         else:
