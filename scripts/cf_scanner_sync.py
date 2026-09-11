@@ -26,7 +26,7 @@ SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
 SYNC_COUNT = 3       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
-ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
+ALL_MODE_LIMIT = 10   # ALL 模式下全局总共选几个
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
