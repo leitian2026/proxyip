@@ -19,7 +19,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -845,9 +845,17 @@ def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix
     只处理传进来的 regions 列表覆盖到的地区——也就是这次运行实际扫描到结果的那些地区。
     如果某个地区之前用旧前缀同步过，但这次运行的地区列表(DEFAULT_REGIONS)里已经不包含它了，
     它名下旧前缀的子域名记录不会被这个函数处理到，需要自己去Cloudflare后台手动清理。
+
+    返回值：True 表示这次全部对齐操作都顺利完成（或者根本不需要对齐）；False 表示中途遇到了
+    异常或者部分记录对齐失败——调用方不应该把这次的 new_prefix 当成"已经对齐过"写进状态文件，
+    否则下次运行会误以为对齐已经完成、不会再重试，相当于永久卡在"半对齐"状态。
+    这里整个函数体包一层 try/except，跟 sync_to_cloudflare() 是同一个模式：Cloudflare API
+    请求本身可能因为网络抖动（超时、连接被重置等）抛出异常，不能让这类临时性问题直接把整个
+    脚本崩掉——这个函数排在扫描/DNS同步/状态保存最前面，一旦在这里崩溃，这次运行后面所有
+    步骤都不会执行，代价比单纯"这次对齐没做成"大得多。
     """
     if old_prefix == new_prefix:
-        return
+        return True
 
     headers = {
         "X-Auth-Email": cf_email,
@@ -855,31 +863,42 @@ def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix
         "Content-Type": "application/json"
     }
 
-    for region in regions:
-        old_domain = f"{old_prefix}{region.lower()}.{base_domain}"
-        new_domain = f"{new_prefix}{region.lower()}.{base_domain}"
-        if old_domain == new_domain:
-            continue
+    all_ok = True
+    try:
+        for region in regions:
+            old_domain = f"{old_prefix}{region.lower()}.{base_domain}"
+            new_domain = f"{new_prefix}{region.lower()}.{base_domain}"
+            if old_domain == new_domain:
+                continue
 
-        old_records = _fetch_all_dns_records(zone_id, headers, old_domain)
-        if not old_records:
-            continue
+            old_records = _fetch_all_dns_records(zone_id, headers, old_domain)
+            if old_records is None:
+                all_ok = False
+                continue
+            if not old_records:
+                continue
 
-        print(f"[Prefix Align] 把 {old_domain} 的 {len(old_records)} 条记录对齐改名到 {new_domain} ...")
-        for r in old_records:
-            patch_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{r['id']}"
-            data = {
-                "type": r.get("type", "A"),
-                "name": new_domain,
-                "content": r.get("content"),
-                "ttl": r.get("ttl", 60),
-                "proxied": r.get("proxied", False),
-            }
-            patch_resp = requests.patch(patch_url, headers=headers, json=data).json()
-            if patch_resp.get("success"):
-                print(f"  已对齐: {r.get('content')}  {old_domain} -> {new_domain}")
-            else:
-                print(f"  Warning: 对齐失败 {r.get('content')} ({old_domain} -> {new_domain}): {patch_resp.get('errors')}")
+            print(f"[Prefix Align] 把 {old_domain} 的 {len(old_records)} 条记录对齐改名到 {new_domain} ...")
+            for r in old_records:
+                patch_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{r['id']}"
+                data = {
+                    "type": r.get("type", "A"),
+                    "name": new_domain,
+                    "content": r.get("content"),
+                    "ttl": r.get("ttl", 60),
+                    "proxied": r.get("proxied", False),
+                }
+                patch_resp = requests.patch(patch_url, headers=headers, json=data).json()
+                if patch_resp.get("success"):
+                    print(f"  已对齐: {r.get('content')}  {old_domain} -> {new_domain}")
+                else:
+                    print(f"  Warning: 对齐失败 {r.get('content')} ({old_domain} -> {new_domain}): {patch_resp.get('errors')}")
+                    all_ok = False
+    except Exception as e:
+        print(f"Exception during subdomain prefix alignment: {e}")
+        return False
+
+    return all_ok
 
 
 def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET):
@@ -1194,11 +1213,18 @@ def main():
         last_prefix = load_last_subdomain_prefix()
         if last_prefix != SUBDOMAIN_PREFIX:
             print(f"\n检测到 SUBDOMAIN_PREFIX 从 \"{last_prefix}\" 改成了 \"{SUBDOMAIN_PREFIX}\"，开始一次性对齐DNS记录名称...")
-            align_subdomain_prefix(
+            align_ok = align_subdomain_prefix(
                 api_token, zone_id, base_domain, cf_email,
                 last_prefix, SUBDOMAIN_PREFIX, list(valid_ips_by_region.keys())
             )
-        save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
+            if align_ok:
+                save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
+            else:
+                print("Warning: SUBDOMAIN_PREFIX 对齐未完全成功，这次不更新前缀状态文件，下次运行会自动重试对齐。")
+                notify_issue("SUBDOMAIN_PREFIX 对齐过程中出现异常或部分失败",
+                              f"前缀从 \"{last_prefix}\" 改成 \"{SUBDOMAIN_PREFIX}\" 未完全对齐成功，下次运行会自动重试")
+        else:
+            save_last_subdomain_prefix(SUBDOMAIN_PREFIX)
     # can_sync 为 False 时（没配CF凭证）不做对齐，也不更新状态文件——
     # 这样等以后配置好凭证再跑，仍然能检测到这次的前缀变化并补做对齐。
 
