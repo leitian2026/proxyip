@@ -2,6 +2,7 @@ import os
 import random
 import time
 import threading
+import bisect
 import requests
 import concurrent.futures
 from datetime import datetime
@@ -17,7 +18,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -25,8 +26,8 @@ SUBDOMAIN_PREFIX = "ab"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-SYNC_COUNT = 3       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
-ALL_MODE_LIMIT = 10   # ALL 模式下全局总共选几个
+SYNC_COUNT = 5       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
+ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
@@ -43,12 +44,20 @@ TOTAL_REQUEST_LIMIT = 20000  # 整个扫描阶段最多发起多少次测速请�
 
 # === 热点网段候选权重（取代原来单一的 /24 热点段）===
 # 同时维护 /24、/16 两种粒度的历史热点网段，生成随机 IP 时按权重从三档里抽：
-# 40% 从历史 /24 热点段抽 -> 命中率最高，最省请求
-# 20% 从历史 /16 热点段抽 -> 范围更广，兼顾同一大网段下的新 /24
-# 40% 从全量 CF_CIDRS 纯随机抽 -> 唯一能发现全新网段、维持 ips-v4.txt 网段库多样性的来源
-HOT_24_WEIGHT = 0.40
-HOT_16_WEIGHT = 0.20
-# 剩下的 0.40 概率落到全量池，不单独定义变量
+# 20% 从历史 /24 热点段抽 -> 命中率最高，最省请求
+# 25% 从历史 /16 热点段抽 -> 范围更广，兼顾同一大网段下的新 /24
+# 55% 从全量 CF_CIDRS 纯随机抽 -> 唯一能发现全新网段、维持 ips-v4.txt 网段库多样性的来源
+HOT_24_WEIGHT = 0.20
+HOT_16_WEIGHT = 0.25
+# 剩下的 0.60 概率落到全量池，不单独定义变量
+
+# === 轮询覆盖 + 新增网段优先测试 用到的状态文件 ===
+# CURSOR_STATE_FILE: 记录 hot_24 / hot_16 两个池子各自"上次轮到哪个网段"，跨运行持久化，
+#                     保证按固定顺序轮流选网段时不会因为进程重启就从头开始、导致后面的网段永远轮不到。
+# KNOWN_SUBNETS_FILE: 记录截止上次运行结束，脚本已经处理过的 /24 网段全集，
+#                      本次运行时跟当前 ips-v4.txt 解析出的网段做差集，找出"新增"的网段优先测试。
+CURSOR_STATE_FILE = "subnet_cursor.state"
+KNOWN_SUBNETS_FILE = "known_subnets.state"
 # ==========================================
 
     # === Cloudflare IPv4 Ranges (IP段配置区) ===
@@ -79,6 +88,15 @@ CF_CIDRS = load_cf_cidrs()
 _subnet_lock = threading.Lock()
 _subnet24_count = {}
 
+# === 轮询游标的运行期状态 ===
+# 每个池子维护一个"下一个要发的位置"下标，多线程并发时靠各自的锁保证每次都拿到不重复的下一个位置。
+# 这里存的是内存里的进度；真正跨运行持久化的是"上次发到的具体网段值"（见 CURSOR_STATE_FILE），
+# 每次运行开始时用 _init_cursor_index() 把内存下标定位到"上次那个网段"之后，再开始轮询。
+_hot24_cursor_lock = threading.Lock()
+_hot24_cursor_state = {"idx": 0}
+_hot16_cursor_lock = threading.Lock()
+_hot16_cursor_state = {"idx": 0}
+
 
 def _is_cidr_full(cidr):
     """判断一个 /24 CIDR 网段是否已经达到全局配额上限；/16 不限制。"""
@@ -107,6 +125,78 @@ def _record_valid_ip(ip):
         _subnet24_count[key24] = _subnet24_count.get(key24, 0) + 1
 
 
+def _unrecord_valid_ip(ip):
+    """撤销一次 _record_valid_ip 的记录。用于"新增网段挤占已满名额"时，
+    把被顶替下去的旧IP占用的网段配额归还，避免 _subnet24_count 虚高、
+    导致那个网段在这次运行剩余时间里被误判为"已满"而被跳过。"""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return
+    key24 = ".".join(parts[:3])
+    with _subnet_lock:
+        if key24 in _subnet24_count:
+            _subnet24_count[key24] -= 1
+            if _subnet24_count[key24] <= 0:
+                del _subnet24_count[key24]
+
+
+def _try_replace_full_bucket(bucket, result):
+    """某地区的bucket已经凑满 sync_count 时，让"新增网段优先测"的结果强行挤进去，
+    替换掉一个旧条目，bucket总长度不变（不突破配额上限）：
+      1. 优先替换掉bucket里跟新结果同一个 /24 网段的旧条目——反正同网段最终选择阶段
+         (select_diverse_ips, MAX_PER_SUBNET=1) 也只会留1个，谁留下不影响配额计数，
+         不需要改 _subnet24_count。
+      2. 找不到同网段的旧条目，就替换掉当前延迟最差的那一条，并把它原来占的网段配额
+         归还、给新网段登记配额，保证 _subnet24_count 在整个运行期间保持准确。
+    bucket为空时说明"凑满"这个前提根本不成立，直接返回 False（防御性判断，理论上不会走到）。
+    """
+    if not bucket:
+        return False
+
+    ip_subnet = ".".join(result["ip"].split(".")[:3])
+    for i, existing in enumerate(bucket):
+        if ".".join(existing["ip"].split(".")[:3]) == ip_subnet:
+            bucket[i] = result
+            return True
+
+    worst_idx = max(range(len(bucket)), key=lambda i: bucket[i]["latency"])
+    replaced = bucket[worst_idx]
+    bucket[worst_idx] = result
+    _unrecord_valid_ip(replaced["ip"])
+    _record_valid_ip(result["ip"])
+    return True
+
+
+def _try_replace_all_mode(valid_ips_by_region, result, colo):
+    """ALL模式下的等价逻辑：全局(不分colo)找同网段的旧条目替换；
+    找不到就替换全局延迟最差的那一条。colo 参数用大写后的地区码，
+    保证新结果被放进正确大小写的桶里，不产生重复的大小写key。"""
+    ip_subnet = ".".join(result["ip"].split(".")[:3])
+
+    for colo_key, lst in valid_ips_by_region.items():
+        for i, existing in enumerate(lst):
+            if ".".join(existing["ip"].split(".")[:3]) == ip_subnet:
+                lst.pop(i)
+                valid_ips_by_region.setdefault(colo, []).append(result)
+                return True
+
+    worst_colo, worst_idx, worst_latency = None, None, -1
+    for colo_key, lst in valid_ips_by_region.items():
+        for i, existing in enumerate(lst):
+            if existing["latency"] > worst_latency:
+                worst_latency = existing["latency"]
+                worst_colo, worst_idx = colo_key, i
+
+    if worst_colo is not None:
+        replaced = valid_ips_by_region[worst_colo].pop(worst_idx)
+        valid_ips_by_region.setdefault(colo, []).append(result)
+        _unrecord_valid_ip(replaced["ip"])
+        _record_valid_ip(result["ip"])
+        return True
+
+    return False
+
+
 def load_hot_subnets(file_path="ips-v4.txt"):
     """从历史结果文件里提取 /24 和 /16 两种粒度的热点网段（用于生成阶段加权抽样）"""
     hot_24, hot_16 = set(), set()
@@ -125,6 +215,135 @@ def load_hot_subnets(file_path="ips-v4.txt"):
         except Exception as e:
             print(f"Warning: 读取历史热点网段失败: {e}")
     return list(hot_24), list(hot_16)
+
+
+def _cidr_sort_key(cidr):
+    """把 CIDR 转成可比较的数值元组，用于生成固定顺序（轮询必须依赖稳定顺序，
+    否则 set->list 的随机顺序会让"游标位置"失去意义）。"""
+    base = cidr.split("/")[0]
+    return tuple(int(x) for x in base.split("."))
+
+
+def _init_cursor_index(sorted_list, last_cidr):
+    """根据上次持久化的"最后一个网段"，在当前(可能已变化的)排序列表里定位到它之后的位置，
+    作为这次运行轮询的起点。找不到（网段已被挤出列表）就定位到"排序后紧跟在它后面"的位置，
+    而不是退回到列表开头——避免前面提到的"总是从头轮、后面的网段永远轮不到"的问题。
+    列表为空或没有历史记录时，从0开始。"""
+    if not sorted_list or not last_cidr:
+        return 0
+    try:
+        last_key = _cidr_sort_key(last_cidr)
+    except Exception:
+        return 0
+    keys = [_cidr_sort_key(c) for c in sorted_list]
+    idx = bisect.bisect_right(keys, last_key)
+    return idx % len(sorted_list)
+
+
+def _final_cursor_cidr(sorted_list, state):
+    """根据这次运行结束时内存里的游标下标，反推出"最后一个被轮到的网段"，用于持久化。"""
+    if not sorted_list or state["idx"] == 0:
+        return None
+    n = len(sorted_list)
+    idx = (state["idx"] - 1) % n
+    return sorted_list[idx]
+
+
+def init_round_robin_cursors(hot_24_sorted, hot_16_sorted, last_hot24_cidr, last_hot16_cidr):
+    """每次运行开始时调用一次：把内存游标定位到上次结束的位置之后。"""
+    _hot24_cursor_state["idx"] = _init_cursor_index(hot_24_sorted, last_hot24_cidr)
+    _hot16_cursor_state["idx"] = _init_cursor_index(hot_16_sorted, last_hot16_cidr)
+
+
+def get_final_cursor_cidrs(hot_24_sorted, hot_16_sorted):
+    """运行结束时调用一次：取出这次实际轮到的最后一个网段，用于写回状态文件。"""
+    return (
+        _final_cursor_cidr(hot_24_sorted, _hot24_cursor_state),
+        _final_cursor_cidr(hot_16_sorted, _hot16_cursor_state),
+    )
+
+
+def _next_hot24_cidr(sorted_list):
+    """轮询选择下一个 /24 热点网段。如果轮到的网段本轮配额已满(_is_cidr_full)，
+    跳过它、游标继续往前挪，但不消耗一次测速请求名额；最多尝试一整圈，
+    如果全部都满就返回 None，交给调用方回退到全量池。"""
+    if not sorted_list:
+        return None
+    n = len(sorted_list)
+    with _hot24_cursor_lock:
+        for _ in range(n):
+            idx = _hot24_cursor_state["idx"] % n
+            _hot24_cursor_state["idx"] += 1
+            cidr = sorted_list[idx]
+            if not _is_cidr_full(cidr):
+                return cidr
+        return None
+
+
+def _next_hot16_cidr(sorted_list):
+    """轮询选择下一个 /16 热点网段。/16 本身不限制配额，直接按顺序轮流发。"""
+    if not sorted_list:
+        return None
+    with _hot16_cursor_lock:
+        idx = _hot16_cursor_state["idx"] % len(sorted_list)
+        _hot16_cursor_state["idx"] += 1
+        return sorted_list[idx]
+
+
+def load_cursor_state(file_path=CURSOR_STATE_FILE):
+    """读取上次持久化的轮询游标（hot_24 / hot_16 各自最后轮到的网段）。
+    文件不存在或读取失败时返回 (None, None)，等价于"从头开始"。"""
+    hot24_cursor, hot16_cursor = None, None
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    val = val.strip()
+                    if key == "HOT24":
+                        hot24_cursor = val or None
+                    elif key == "HOT16":
+                        hot16_cursor = val or None
+        except Exception as e:
+            print(f"Warning: 读取轮询游标状态文件 {file_path} 失败: {e}")
+    return hot24_cursor, hot16_cursor
+
+
+def save_cursor_state(hot24_cursor, hot16_cursor, file_path=CURSOR_STATE_FILE):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(f"HOT24={hot24_cursor or ''}\n")
+            f.write(f"HOT16={hot16_cursor or ''}\n")
+    except Exception as e:
+        print(f"Warning: 保存轮询游标状态文件 {file_path} 失败: {e}")
+
+
+def load_known_subnets(file_path=KNOWN_SUBNETS_FILE):
+    """读取截止上次运行，已经处理过的 /24 网段全集。文件不存在时视为空集合
+    （等价于"这次全部网段都是新增"，第一次跑会全部优先测一轮，属于预期行为）。"""
+    known = set()
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        known.add(line)
+        except Exception as e:
+            print(f"Warning: 读取已知网段状态文件 {file_path} 失败: {e}")
+    return known
+
+
+def save_known_subnets(subnets, file_path=KNOWN_SUBNETS_FILE):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            for cidr in sorted(subnets, key=_cidr_sort_key):
+                f.write(f"{cidr}\n")
+    except Exception as e:
+        print(f"Warning: 保存已知网段状态文件 {file_path} 失败: {e}")
 
 
 def _random_ip_from_cidr(cidr):
@@ -153,22 +372,27 @@ def _random_ip_from_cidr(cidr):
     return f"{p1}.{p2}.{p3}.{p4}"
 
 
-def generate_random_ip(hot_24_cidrs, hot_16_cidrs, all_cidrs):
+def generate_random_ip(hot_24_sorted, hot_16_sorted, all_cidrs):
     """
     按权重从三档候选池里抽一个网段，再在网段内随机生成一个IP：
     HOT_24_WEIGHT(20%) 历史/24热点段 / HOT_16_WEIGHT(25%) 历史/16热点段 / 剩余55% 全量CF段。
-    抽样时会主动跳过"全局配额已满"的热点 /24 网段，避免生成注定会在筛选阶段被
-    丢弃的候选，节省测速请求；/16 本身不受2个限制。
+
+    档内选择哪一个具体网段，改成"按固定顺序轮流选"(_next_hot24_cidr / _next_hot16_cidr)，
+    而不是纯随机 random.choice——纯随机会导致候选网段数量一多，某些网段（尤其是刚加进去的）
+    长期抽不到；轮询能保证只要预算/运行次数足够，每个网段迟早都会被选中一次。
+    hot_24 档轮到"全局配额已满"的网段会自动跳过（游标继续走），不会浪费测速请求；
+    /16 本身不受配额限制，直接按顺序轮流发。
     """
     for _ in range(20):
         try:
             roll = random.random()
 
-            if roll < HOT_24_WEIGHT and hot_24_cidrs:
-                pool = [c for c in hot_24_cidrs if not _is_cidr_full(c)]
-                cidr = random.choice(pool) if pool else random.choice(all_cidrs)
-            elif roll < HOT_24_WEIGHT + HOT_16_WEIGHT and hot_16_cidrs:
-                cidr = random.choice(hot_16_cidrs)
+            if roll < HOT_24_WEIGHT and hot_24_sorted:
+                cidr = _next_hot24_cidr(hot_24_sorted)
+                if cidr is None:
+                    cidr = random.choice(all_cidrs)
+            elif roll < HOT_24_WEIGHT + HOT_16_WEIGHT and hot_16_sorted:
+                cidr = _next_hot16_cidr(hot_16_sorted)
             else:
                 cidr = random.choice(all_cidrs)
 
@@ -506,7 +730,7 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
 
 
-def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit):
+def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit, priority_cidrs=None):
     """
     流式扫描：线程池维持恒定并发(CONCURRENCY)，每完成一个测速请求就立刻检查一次状态，
     决定是否需要补一个新任务进去，不再有"轮次/批次"的概念。
@@ -514,10 +738,14 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
     停止条件（满足任一即停）：
       1. 每个目标地区都凑够了 sync_count 个原始命中（ALL模式下是全局凑够 all_mode_limit 个）
       2. 累计发起的测速请求总数达到 TOTAL_REQUEST_LIMIT 硬上限
+    但达到停止条件时，如果 priority_cidrs（本次新增网段）对应的测速请求还没跑完，
+    不会立刻取消——会先停止补充新的普通候选，等这些"必须等结果"的请求全部完成后才真正停止，
+    保证新增网段这次一定能拿到一个真实测试结果，不会被提前 cancel 掉。
     """
     valid_ips_by_region = {} if is_scan_all else {r: [] for r in target_regions}
     total_submitted = 0
     submit_lock = threading.Lock()
+    priority_cidrs = priority_cidrs or []
 
     def is_done():
         if is_scan_all:
@@ -535,7 +763,25 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
         pending = set()
-        for _ in range(CONCURRENCY):
+        priority_pending = set()
+        # priority_futures 跟 priority_pending 不同：这个集合从提交开始就不再删除任何元素，
+        # 只用来在结果处理阶段判断"这个已经跑完的future，是不是当初新增网段那批里的"。
+        priority_futures = set()
+
+        # 优先批次：本次识别到的新增网段，排在最前面提交，保证真正发起测速请求，
+        # 且不占用原有权重抽样逻辑（这里直接在网段内随机生成地址，跟原有 hot_24/hot_16
+        # 命中后的处理方式一致，只是网段本身是"指定"的，不是抽签抽中的）。
+        for cidr in priority_cidrs[:CONCURRENCY]:
+            with submit_lock:
+                total_submitted += 1
+            ip = _random_ip_from_cidr(cidr)
+            fut = executor.submit(test_ip, ip, check_api_url)
+            pending.add(fut)
+            priority_pending.add(fut)
+            priority_futures.add(fut)
+
+        remaining_slots = CONCURRENCY - len(pending)
+        for _ in range(max(remaining_slots, 0)):
             fut = try_submit(executor)
             if fut:
                 pending.add(fut)
@@ -544,27 +790,44 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
             done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
 
             for fut in done:
+                priority_pending.discard(fut)
+                is_priority = fut in priority_futures
                 result = fut.result()
                 if result:
                     ip = result["ip"]
                     colo = result.get("colo", "UNK").upper()
                     if colo != "UNK" and (is_scan_all or colo in target_regions):
-                        bucket = valid_ips_by_region.setdefault(colo, [])
                         if is_scan_all:
                             total_now = sum(len(v) for v in valid_ips_by_region.values())
                             if total_now < all_mode_limit:
+                                bucket = valid_ips_by_region.setdefault(colo, [])
                                 bucket.append(result)
                                 _record_valid_ip(ip)
                                 print(f"[FOUND {colo}] {ip} (Total ALL: {total_now + 1}/{all_mode_limit})")
+                            elif is_priority:
+                                # 名额已经凑满，但这是新增网段的结果——挤掉一个旧条目也要把它留下
+                                if _try_replace_all_mode(valid_ips_by_region, result, colo):
+                                    _record_valid_ip(ip)
+                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total ALL 仍为 {all_mode_limit})")
                         else:
+                            bucket = valid_ips_by_region.setdefault(colo, [])
                             if len(bucket) < sync_count:
                                 bucket.append(result)
                                 _record_valid_ip(ip)
                                 print(f"[FOUND {colo}] {ip} (Total {colo}: {len(bucket)}/{sync_count})")
+                            elif is_priority:
+                                # 名额已经凑满，但这是新增网段的结果——挤掉一个旧条目也要把它留下
+                                if _try_replace_full_bucket(bucket, result):
+                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total {colo} 仍为 {sync_count})")
 
-            if is_done() or total_submitted >= TOTAL_REQUEST_LIMIT:
+            stop_requested = is_done() or total_submitted >= TOTAL_REQUEST_LIMIT
+            if stop_requested and not priority_pending:
                 executor.shutdown(wait=False, cancel_futures=True)
                 break
+            if stop_requested:
+                # 已经达到停止条件，但新增网段的优先请求还没出结果：
+                # 不再补充新的普通候选，只等这些"必须等结果"的请求完成。
+                continue
 
             slots = CONCURRENCY - len(pending)
             for _ in range(max(slots, 0)):
@@ -601,6 +864,25 @@ def main():
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
     print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
 
+    # 固定顺序排序，供轮询使用（set->list 顺序不稳定，轮询必须依赖确定性顺序）
+    hot_24_set = set(hot_24)
+    hot_24_sorted = sorted(hot_24_set, key=_cidr_sort_key)
+    hot_16_sorted = sorted(set(hot_16), key=_cidr_sort_key)
+
+    # 轮询游标：读取上次持久化的位置，定位这次的起点（跨运行推进，不会从头开始）
+    last_hot24_cursor, last_hot16_cursor = load_cursor_state()
+    init_round_robin_cursors(hot_24_sorted, hot_16_sorted, last_hot24_cursor, last_hot16_cursor)
+
+    # 新增网段识别：跟上次已知网段集合做差集，找出这次相对上次新出现的网段（不管是
+    # 手动加进 ips-v4.txt 的，还是上次运行自己扫到写进去的），本轮优先测试。
+    # 一次最多优先测 CONCURRENCY 个（对应初始批次的名额上限），处理不完的这次先不标记为
+    # "已知"，下次运行还会继续被当作新增、有机会补测到。
+    known_subnets = load_known_subnets()
+    new_subnets_all = hot_24_set - known_subnets
+    priority_cidrs = sorted(new_subnets_all, key=_cidr_sort_key)[:CONCURRENCY]
+    if new_subnets_all:
+        print(f"检测到 {len(new_subnets_all)} 个新增网段，本次优先测试其中 {len(priority_cidrs)} 个: {priority_cidrs}")
+
     can_sync = True
     if not all([api_token, zone_id, base_domain, cf_email]):
         print("Warning: Missing required environment variables (CF_API_TOKEN, CF_ZONE_ID, CF_TARGET_DOMAIN, CF_EMAIL).")
@@ -609,9 +891,18 @@ def main():
 
     print(f"Starting streaming scan (concurrency={CONCURRENCY}, total request cap={TOTAL_REQUEST_LIMIT})...")
     valid_ips_by_region, total_submitted = scan_stream(
-        hot_24, hot_16, CF_CIDRS, check_api_url,
-        target_regions, is_scan_all, sync_count, ALL_MODE_LIMIT
+        hot_24_sorted, hot_16_sorted, CF_CIDRS, check_api_url,
+        target_regions, is_scan_all, sync_count, ALL_MODE_LIMIT,
+        priority_cidrs=priority_cidrs
     )
+
+    # 保存轮询游标 + 已知网段状态：必须放在下面 total_found==0 触发 exit(1) 之前，
+    # 保证不管这次扫描有没有找到有效IP，这两个状态都会落盘，不会因为提前退出而丢失进度
+    # （这两个文件记录的是"脚本内部处理进度"，跟"这次扫描业务上有没有结果"是两回事）。
+    hot24_final_cursor, hot16_final_cursor = get_final_cursor_cidrs(hot_24_sorted, hot_16_sorted)
+    save_cursor_state(hot24_final_cursor, hot16_final_cursor)
+    known_next = (hot_24_set - new_subnets_all) | set(priority_cidrs)
+    save_known_subnets(known_next)
 
     print("\nScan completed. Summary:")
     total_found = 0
