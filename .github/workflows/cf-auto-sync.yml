@@ -40,7 +40,7 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          for f in ips-v4.txt subdomain_prefix.state subnet_cursor.state known_subnets.state subnet_health.state; do
+          for f in ips-v4.txt subdomain_prefix.state subnet_cursor.state known_subnets.state subnet_health.state region_miss_streak.state; do
             [ -f "$f" ] && git add "$f"
           done
           # Only commit if there are changes
