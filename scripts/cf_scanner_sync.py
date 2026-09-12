@@ -19,7 +19,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -45,12 +45,12 @@ TOTAL_REQUEST_LIMIT = 20000  # 整个扫描阶段最多发起多少次测速请�
 
 # === 热点网段候选权重（取代原来单一的 /24 热点段）===
 # 同时维护 /24、/16 两种粒度的历史热点网段，生成随机 IP 时按权重从三档里抽：
-# 40% 从历史 /24 热点段抽 -> 命中率最高，最省请求
-# 20% 从历史 /16 热点段抽 -> 范围更广，兼顾同一大网段下的新 /24
-# 40% 从全量 CF_CIDRS 纯随机抽 -> 唯一能发现全新网段、维持 ips-v4.txt 网段库多样性的来源
-HOT_24_WEIGHT = 0.40
-HOT_16_WEIGHT = 0.20
-# 剩下的 0.40 概率落到全量池，不单独定义变量
+# 20% 从历史 /24 热点段抽 -> 命中率最高，最省请求
+# 25% 从历史 /16 热点段抽 -> 范围更广，兼顾同一大网段下的新 /24
+# 55% 从全量 CF_CIDRS 纯随机抽 -> 唯一能发现全新网段、维持 ips-v4.txt 网段库多样性的来源
+HOT_24_WEIGHT = 0.20
+HOT_16_WEIGHT = 0.25
+# 剩下的 0.60 概率落到全量池，不单独定义变量
 
 # === 轮询覆盖 + 新增网段优先测试 用到的状态文件 ===
 # CURSOR_STATE_FILE: 记录 hot_24 / hot_16 两个池子各自"上次轮到哪个网段"，跨运行持久化，
@@ -789,7 +789,7 @@ def _fetch_all_dns_records(zone_id, headers, name_filter, record_type="A"):
     page = 1
     base_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={name_filter}&per_page=100"
     while True:
-        resp = requests.get(f"{base_url}&page={page}", headers=headers).json()
+        resp = requests.get(f"{base_url}&page={page}", headers=headers, timeout=15).json()
         if not resp.get("success"):
             print(f"Failed to fetch DNS records for {name_filter}:", resp)
             return None
@@ -842,7 +842,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
             if ip_val not in final_set:
                 print(f"Deleting outdated/over-quota IP: {ip_val} (created_on={info['created_on']})")
                 del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{info['id']}"
-                del_resp = requests.delete(del_url, headers=headers).json()
+                del_resp = requests.delete(del_url, headers=headers, timeout=15).json()
                 if not del_resp.get("success"):
                     print(f"  Warning: 删除 {ip_val} 失败: {del_resp.get('errors')}")
                     delete_failures.append(ip_val)
@@ -861,7 +861,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                     "ttl": 60,
                     "proxied": False
                 }
-                post_resp = requests.post(post_url, headers=headers, json=data).json()
+                post_resp = requests.post(post_url, headers=headers, json=data, timeout=15).json()
                 if not post_resp.get("success"):
                     print(f"  Warning: 添加 {ip_val} 失败: {post_resp.get('errors')}")
                     add_failures.append(ip_val)
@@ -967,7 +967,7 @@ def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix
                     "ttl": r.get("ttl", 60),
                     "proxied": r.get("proxied", False),
                 }
-                patch_resp = requests.patch(patch_url, headers=headers, json=data).json()
+                patch_resp = requests.patch(patch_url, headers=headers, json=data, timeout=15).json()
                 if patch_resp.get("success"):
                     print(f"  已对齐: {r.get('content')}  {old_domain} -> {new_domain}")
                 else:
