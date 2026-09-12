@@ -19,7 +19,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = ""
+SUBDOMAIN_PREFIX = "ab"
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -29,7 +29,7 @@ SYNC_MAIN_DOMAIN = "NO"
 # 🎯 扫描与同步数量设置
 SYNC_COUNT = 5       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
-MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
+MAX_IPS_FILE = 50    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
 # 最终筛选时：相同前三段(A.B.C)的IP最多入选 MAX_PER_SUBNET 个（当前=1个）；前两段相同不额外限制
