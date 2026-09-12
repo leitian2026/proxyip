@@ -3,6 +3,7 @@ import random
 import time
 import threading
 import bisect
+import traceback
 import requests
 import concurrent.futures
 from datetime import datetime
@@ -18,7 +19,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -83,6 +84,75 @@ SUBNET_PROBE_TIERS = [
 # SUBNET_HEALTH_FILE: 记录截止上次运行结束，仍处于"连续失败次数>0"状态的 /24 网段
 # （前三段=次数，一行一个；次数清零的网段不会出现在文件里，避免无限膨胀）。
 SUBNET_HEALTH_FILE = "subnet_health.state"
+
+# === 系统性故障熔断 ===
+# 背景：如果 CHECK_API_URL（检测接口）本身挂了、或者出口网络抽风，会导致这次运行里
+# 几乎所有网段都测不通——这不是"这些网段真的不行了"，是检测通道本身出了问题。
+# 如果照常把这种"大面积失败"计入每个网段的健康度，会把一大批健康网段一起打入冷却区，
+# 接口恢复正常后还得等好多次运行才能把它们逐个捞回来重新验证，等于误伤被放大。
+# 判断标准：这次运行"已知网段"(在 ips-v4.txt 里有记录的)的测试样本数和失败率同时达标，
+# 才怀疑是系统性问题；样本数门槛是为了避免"就测了两三个、刚好都没中"这种小样本波动
+# 被误判成系统性故障。触发后，这次运行对健康度的所有更新都不落盘，直接沿用上次的状态。
+SYSTEMIC_FAILURE_MIN_SAMPLES = 15
+SYSTEMIC_FAILURE_RATE_THRESHOLD = 0.9
+# ==========================================
+
+# === Telegram 异常通知 ===
+# 只在下面这几类"够资格算异常"的情况下发通知，避免变成没人看的噪音：
+#   1) 脚本未捕获的异常导致整个进程崩溃
+#   2) 环境/配置缺失导致还没开始扫描就退出（ip.txt缺失/为空、CHECK_API_URL未设置）
+#   3) 本次扫描一个有效IP都没找到
+#   4) 系统性故障熔断触发（怀疑检测接口/出口网络本身有问题）
+#   5) Cloudflare凭证缺失导致DNS同步被跳过、或DNS同步过程中实际报错失败
+# 健康度冷却网段数量变化、个别新增网段没测通这类"设计上就会自然出现、自己会恢复"的
+# 情况，不发通知——发多了大家会当噪音直接划掉，反而会错过真正重要的那几条。
+#
+# TG_BOT_TOKEN / TG_CHAT_ID 这两个环境变量任一缺失，都直接跳过发送（不算错误，
+# 大概率是还没配置这个功能），发送过程本身出任何问题也只打印警告，绝不能让
+# "通知失败"反过来影响脚本的正常执行或退出流程。
+NOTIFY_PREFIX = "🚨 [CF-Scanner异常]"
+
+
+def send_telegram_notification(message):
+    """把一条消息推送到Telegram。缺少配置或者发送失败都只打印警告，不抛异常。"""
+    bot_token = os.environ.get("TG_BOT_TOKEN")
+    chat_id = os.environ.get("TG_CHAT_ID")
+    if not bot_token or not chat_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
+        ok = False
+        try:
+            ok = resp.json().get("ok", False)
+        except Exception:
+            pass
+        if not resp.ok or not ok:
+            print(f"Warning: Telegram通知发送失败: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"Warning: Telegram通知发送异常: {e}")
+
+
+def _github_run_url():
+    """拼出这次GitHub Actions运行记录的URL，方便通知里直接点开看详情。
+    这几个GITHUB_*环境变量是Actions runner自动注入的，不需要额外配置。"""
+    server = os.environ.get("GITHUB_SERVER_URL")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if server and repo and run_id:
+        return f"{server}/{repo}/actions/runs/{run_id}"
+    return None
+
+
+def notify_issue(title, detail=""):
+    """统一的异常通知入口：拼好标题/详情/运行链接，交给 send_telegram_notification 发出去。"""
+    lines = [f"{NOTIFY_PREFIX} {title}"]
+    if detail:
+        lines.append(detail)
+    run_url = _github_run_url()
+    if run_url:
+        lines.append(f"详情: {run_url}")
+    send_telegram_notification("\n".join(lines))
 # ==========================================
 
     # === Cloudflare IPv4 Ranges (IP段配置区) ===
@@ -90,16 +160,19 @@ SUBNET_HEALTH_FILE = "subnet_health.state"
 def load_cf_cidrs(file_path="ip.txt"):
     if not os.path.exists(file_path):
         print(f"Error: 找不到 {file_path} 文件！请确保该文件存在并填写了需要扫描的 IP 段。")
+        notify_issue(f"找不到 {file_path} 文件，扫描无法启动")
         exit(1)
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             cidrs = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
         if not cidrs:
             print(f"Error: {file_path} 文件为空！请在里面填入需要扫描的网段 (CIDR)。")
+            notify_issue(f"{file_path} 文件为空，扫描无法启动")
             exit(1)
         return cidrs
     except Exception as e:
         print(f"Error: 读取 {file_path} 失败！错误信息: {e}")
+        notify_issue(f"读取 {file_path} 失败", str(e))
         exit(1)
 
 CF_CIDRS = load_cf_cidrs()
@@ -120,6 +193,16 @@ _subnet24_count = {}
 _subnet_health_lock = threading.Lock()
 _subnet_health = {}
 _known_hot24_keys = set()
+
+# === 本次运行的统计计数器（不持久化，只用于这次运行的日志汇总和熔断判断）===
+# _health_test_stats: 本次运行里，"已知网段"(在 _known_hot24_keys 里)被实际测试的
+#                      总次数和失败次数，用于运行结束后判断是不是系统性故障。
+# _skip_stats: 轮询时"因为配额已满跳过"和"因为健康度冷却跳过"分别计了多少次，
+#              用于运行结束后打印一行汇总，避免每次跳过都打一行日志刷屏。
+_health_test_stats_lock = threading.Lock()
+_health_test_stats = {"total": 0, "failed": 0}
+_skip_stats_lock = threading.Lock()
+_skip_stats = {"quota_full": 0, "health_throttled": 0}
 
 # === 轮询游标的运行期状态 ===
 # 每个池子维护一个"下一个要发的位置"下标，多线程并发时靠各自的锁保证每次都拿到不重复的下一个位置。
@@ -193,7 +276,8 @@ def _record_subnet_test_result(ip, success):
     """记录一次真实测试结果对"/24网段健康度"的影响：只对本次运行开始时
     _known_hot24_keys（ips-v4.txt 已有网段）里的网段生效，不在里面的IP不处理——
     这样才不会把"全新网段第一次没测通"也算作"该网段一直不行"。
-    只要有一次测通，立刻清零；测不通则连续失败次数+1。"""
+    只要有一次测通，立刻清零；测不通则连续失败次数+1。
+    同时累计本次运行"已知网段"的测试总数/失败数，供运行结束后判断是否系统性故障。"""
     parts = ip.split(".")
     if len(parts) != 4:
         return
@@ -205,6 +289,33 @@ def _record_subnet_test_result(ip, success):
             _subnet_health.pop(key24, None)
         else:
             _subnet_health[key24] = _subnet_health.get(key24, 0) + 1
+    with _health_test_stats_lock:
+        _health_test_stats["total"] += 1
+        if not success:
+            _health_test_stats["failed"] += 1
+
+
+def reset_run_stats():
+    """每次运行开始时调用一次，清空上一次运行可能残留的统计计数器
+    （这些计数器只用于当次运行的日志汇总和熔断判断，不持久化）。"""
+    with _health_test_stats_lock:
+        _health_test_stats["total"] = 0
+        _health_test_stats["failed"] = 0
+    with _skip_stats_lock:
+        _skip_stats["quota_full"] = 0
+        _skip_stats["health_throttled"] = 0
+
+
+def is_systemic_failure_suspected():
+    """判断这次运行是不是"系统性故障"（检测接口/出口网络本身出问题，而不是具体网段不行）：
+    已知网段的测试样本数达到门槛、且失败率达到门槛，两者同时满足才怀疑。
+    返回 (是否怀疑, 总样本数, 失败数)，方便调用方打印细节。"""
+    with _health_test_stats_lock:
+        total = _health_test_stats["total"]
+        failed = _health_test_stats["failed"]
+    if total < SYSTEMIC_FAILURE_MIN_SAMPLES:
+        return False, total, failed
+    return (failed / total) >= SYSTEMIC_FAILURE_RATE_THRESHOLD, total, failed
 
 
 def _try_replace_full_bucket(bucket, result):
@@ -335,6 +446,7 @@ def _next_hot24_cidr(sorted_list):
     1) 本轮配额已满(_is_cidr_full)；
     2) 按该网段当前连续失败次数算出的概率抽签没抽中(_should_probe_subnet)——
        连续失败越多，被跳过的概率越高，但永远有机会被抽到，不会被彻底放弃。
+    两种跳过各自计数(_skip_stats)，运行结束后打印一行汇总，不逐条打印避免刷屏。
     最多尝试一整圈，都不满足就返回 None，交给调用方回退到全量池。"""
     if not sorted_list:
         return None
@@ -345,9 +457,13 @@ def _next_hot24_cidr(sorted_list):
             _hot24_cursor_state["idx"] += 1
             cidr = sorted_list[idx]
             if _is_cidr_full(cidr):
+                with _skip_stats_lock:
+                    _skip_stats["quota_full"] += 1
                 continue
             key24 = ".".join(cidr.split("/")[0].split(".")[:3])
             if not _should_probe_subnet(key24):
+                with _skip_stats_lock:
+                    _skip_stats["health_throttled"] += 1
                 continue
             return cidr
         return None
@@ -960,6 +1076,10 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                     break
                 pending.add(fut)
 
+    with _skip_stats_lock:
+        quota_skips = _skip_stats["quota_full"]
+        health_skips = _skip_stats["health_throttled"]
+    print(f"轮询跳过统计：因配额已满跳过 {quota_skips} 次，因健康度冷却跳过 {health_skips} 次。")
     print(f"\n本次扫描共发起 {total_submitted} 次测速请求（硬上限 {TOTAL_REQUEST_LIMIT}）。")
     return valid_ips_by_region, total_submitted
 
@@ -982,6 +1102,7 @@ def main():
     check_api_url = os.environ.get("CHECK_API_URL")
     if not check_api_url:
         print("Error: 未设置环境变量 CHECK_API_URL（测速检测接口地址），扫描无法进行，直接退出。")
+        notify_issue("未设置 CHECK_API_URL 环境变量，扫描无法启动")
         exit(1)
     sync_count = SYNC_COUNT
 
@@ -995,7 +1116,10 @@ def main():
 
     # 网段健康度：加载上次持久化的"连续失败次数"，并记下这次运行 ips-v4.txt 里
     # 已有哪些 /24 网段——只有落在这个集合里的IP，测试结果才会被计入健康度统计。
-    _subnet_health.update(load_subnet_health())
+    reset_run_stats()
+    loaded_health = load_subnet_health()
+    health_snapshot_at_start = dict(loaded_health)  # 万一这次运行判定为系统性故障，回滚用这份快照
+    _subnet_health.update(loaded_health)
     _known_hot24_keys.update(".".join(c.split("/")[0].split(".")[:3]) for c in hot_24_set)
     if _subnet_health:
         print(f"Loaded subnet health state: {len(_subnet_health)} subnet(s) currently in probe-cooldown.")
@@ -1018,6 +1142,8 @@ def main():
     if not all([api_token, zone_id, base_domain, cf_email]):
         print("Warning: Missing required environment variables (CF_API_TOKEN, CF_ZONE_ID, CF_TARGET_DOMAIN, CF_EMAIL).")
         print("DNS Synchronization will be skipped, but IP scanning will still proceed!")
+        notify_issue("Cloudflare凭证缺失，DNS同步被跳过（本次只扫描不同步）",
+                     "请检查 CF_API_TOKEN / CF_ZONE_ID / CF_TARGET_DOMAIN / CF_EMAIL 这几个Secrets")
         can_sync = False
 
     print(f"Starting streaming scan (concurrency={CONCURRENCY}, total request cap={TOTAL_REQUEST_LIMIT})...")
@@ -1035,7 +1161,25 @@ def main():
     save_cursor_state(hot24_final_cursor, hot16_final_cursor)
     known_next = (hot_24_set - new_subnets_all) | set(priority_cidrs)
     save_known_subnets(known_next)
-    save_subnet_health(_subnet_health)
+
+    # 网段健康度落盘前两步处理：
+    # 1) 系统性故障熔断——如果这次运行"已知网段"的失败率高得不正常(检测接口/出口网络
+    #    本身有问题的信号)，就不采纳这次运行对健康度的更新，回滚到运行开始时的快照，
+    #    避免把一次系统性故障误判成"一大批网段全都不行了"。
+    # 2) 清理陈旧记录——不管用哪份数据落盘，都只保留这次运行 ips-v4.txt 里实际还有的
+    #    网段(_known_hot24_keys)，网段被移出文件后，它的健康度记录不再需要保留，
+    #    避免文件无限累积僵尸记录，也避免它以后被重新加回来时错误继承旧的坏记录。
+    suspected, tested_total, tested_failed = is_systemic_failure_suspected()
+    if suspected:
+        print(f"\nWarning: 本次运行已知网段的测试失败率异常偏高({tested_failed}/{tested_total})，"
+              f"怀疑是检测接口或出口网络本身出了问题，而不是具体网段真的不行——"
+              f"本次运行对健康度状态的更新不会被保存，沿用上次的状态。")
+        notify_issue("系统性故障熔断触发，怀疑检测接口/出口网络异常",
+                     f"已知网段测试样本 {tested_total} 个，失败 {tested_failed} 个（本次健康度更新已丢弃、不落盘）")
+        health_to_save = {k: v for k, v in health_snapshot_at_start.items() if k in _known_hot24_keys and v > 0}
+    else:
+        health_to_save = {k: v for k, v in _subnet_health.items() if k in _known_hot24_keys and v > 0}
+    save_subnet_health(health_to_save)
 
     print("\nScan completed. Summary:")
     total_found = 0
@@ -1078,7 +1222,9 @@ def main():
         if can_sync:
             target_domain = f"{SUBDOMAIN_PREFIX}{region.lower()}.{base_domain}"
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
-            sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
+            sync_ok = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
+            if not sync_ok:
+                notify_issue(f"Cloudflare DNS同步失败: {target_domain}", "请查看Actions运行日志了解具体报错")
         else:
             print(f"\nSkipping Cloudflare DNS Sync for {region} (Missing Credentials).")
 
@@ -1086,12 +1232,20 @@ def main():
         if SYNC_MAIN_DOMAIN.strip().upper() == "YES":
             all_best_ips.sort(key=lambda x: x["latency"])
             print(f"\n[Global Sync] Starting Cloudflare DNS Sync for MAIN DOMAIN: {base_domain}")
-            sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, sync_count=len(all_best_ips))
+            sync_ok = sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, sync_count=len(all_best_ips))
+            if not sync_ok:
+                notify_issue(f"Cloudflare DNS同步失败(主域名): {base_domain}", "请查看Actions运行日志了解具体报错")
         else:
             print(f"\n[Global Sync] Skipped synchronizing to MAIN DOMAIN ({base_domain}) because SYNC_MAIN_DOMAIN is set to NO.")
 
     if total_found == 0:
-        print("No valid IPs found in this scan across any regions. Aborting.")
+        if suspected:
+            print("No valid IPs found in this scan across any regions. Aborting. "
+                  "(已在上面作为系统性故障熔断通知过，这里不重复发送)")
+        else:
+            region_desc = "ALL" if is_scan_all else ", ".join(target_regions)
+            notify_issue("本次扫描未找到任何有效IP", f"目标地区: {region_desc}")
+            print("No valid IPs found in this scan across any regions. Aborting.")
         exit(1)
 
     if all_best_ips:
@@ -1099,4 +1253,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # 注意：这里只会捕获到真正"未预料到"的异常。我们自己主动触发的 exit(1)
+        # 走的是 SystemExit（不是 Exception 的子类），不会被这里拦截、也不会被
+        # 重复通知——那些路径在各自触发的地方已经发过对应场景的通知了。
+        tb = traceback.format_exc()
+        print(tb)
+        notify_issue("脚本运行时发生未捕获异常，本次运行整体失败", tb[-3000:])
+        raise
