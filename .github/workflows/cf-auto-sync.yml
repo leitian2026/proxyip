@@ -32,6 +32,8 @@ jobs:
           CF_TARGET_DOMAIN: ${{ secrets.CF_TARGET_DOMAIN }}
           CF_EMAIL: ${{ secrets.CF_EMAIL }}
           CHECK_API_URL: ${{ secrets.CHECK_API_URL }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python scripts/cf_scanner_sync.py
 
       - name: Commit and Push IP Log
