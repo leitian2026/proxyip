@@ -36,11 +36,33 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python scripts/cf_scanner_sync.py
 
+      # 不管上面这步成功还是失败，这里都要执行——目的是保证这个仓库不会超过60天
+      # 无提交、被GitHub自动暂停定时任务。心跳文件只在距上次心跳超过下面这个
+      # 天数时才更新，避免每天都产生一条纯保活commit。
       - name: Commit and Push IP Log
+        if: always()
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          for f in ips-v4.txt subdomain_prefix.state subnet_cursor.state known_subnets.state subnet_health.state region_miss_streak.state; do
+
+          # ↓↓↓ 想测试20天/45天，就是改这一行这个数字 ↓↓↓
+          HEARTBEAT_INTERVAL_DAYS=30
+
+          now_epoch=$(date -u +%s)
+          if [ -f last_run.state ]; then
+            last_epoch=$(date -u -d "$(cat last_run.state)" +%s 2>/dev/null || echo 0)
+          else
+            last_epoch=0
+          fi
+          diff_days=$(( (now_epoch - last_epoch) / 86400 ))
+          echo "距上次心跳: ${diff_days} 天（阈值: ${HEARTBEAT_INTERVAL_DAYS} 天）"
+
+          if [ "$diff_days" -ge "$HEARTBEAT_INTERVAL_DAYS" ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > last_run.state
+            echo "心跳已更新: $(cat last_run.state)"
+          fi
+
+          for f in ips-v4.txt subdomain_prefix.state subnet_cursor.state known_subnets.state subnet_health.state region_miss_streak.state last_run.state; do
             [ -f "$f" ] && git add "$f"
           done
           # Only commit if there are changes
