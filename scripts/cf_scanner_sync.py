@@ -18,7 +18,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -58,6 +58,31 @@ HOT_16_WEIGHT = 0.25
 #                      本次运行时跟当前 ips-v4.txt 解析出的网段做差集，找出"新增"的网段优先测试。
 CURSOR_STATE_FILE = "subnet_cursor.state"
 KNOWN_SUBNETS_FILE = "known_subnets.state"
+
+# === 网段健康度追踪（/24 专用，/16 不适用）===
+# 背景：一个 /24 网段连续多次测不通，未必是"网段已死"，也可能只是这个网段本来活跃地址
+# 占比就低。所以不做"连续失败N次就永久拉黑"这种二元判断，改成"连续失败次数越多，
+# 下次轮到它时被真正测试的概率越低，但永远不会降到0"，留一条被重新发现的活路。
+#
+# 只对 /24 生效：/24 对应 ips-v4.txt 里的一行具体记录，"连续失败"才有意义；
+# /16 覆盖6万5千多个地址、每次抽中测的都是里面随机一个不相关的/24，不适用这个概念。
+#
+# 统计范围：不只是"轮询专门抽中hot_24网段"才算数——只要这次运行测试的某个IP，
+# 落在 ips-v4.txt 里已有记录的某个/24网段内（不管这个候选来自hot_24轮询、hot_16、
+# 全量随机池、还是新增网段优先测），测通就把该网段的连续失败次数清零，测不通就+1。
+#
+# 分档概率表：按"连续失败次数下限"从大到小排列，落在哪个区间就用对应概率决定
+# "这次轮到它，要不要真的去测"。想调整档位或概率，直接改这个列表即可，不用碰其他代码。
+SUBNET_PROBE_TIERS = [
+    (11, 0.05),   # 连续失败 11 次及以上：5%（留底，不会再往下降）
+    (6, 0.20),    # 连续失败 6~10 次：20%
+    (3, 0.50),    # 连续失败 3~5 次：50%
+    (0, 1.00),    # 连续失败 0~2 次：100%（正常，轮到就测）
+]
+
+# SUBNET_HEALTH_FILE: 记录截止上次运行结束，仍处于"连续失败次数>0"状态的 /24 网段
+# （前三段=次数，一行一个；次数清零的网段不会出现在文件里，避免无限膨胀）。
+SUBNET_HEALTH_FILE = "subnet_health.state"
 # ==========================================
 
     # === Cloudflare IPv4 Ranges (IP段配置区) ===
@@ -87,6 +112,14 @@ CF_CIDRS = load_cf_cidrs()
 # 被实际采纳的有效IP，后续生成候选IP时就主动跳过这个 /24 网段。
 _subnet_lock = threading.Lock()
 _subnet24_count = {}
+
+# === 网段健康度的运行期状态 ===
+# _subnet_health: "A.B.C" -> 连续失败次数（只存 >0 的，加载自/最终会存回 SUBNET_HEALTH_FILE）
+# _known_hot24_keys: 本次运行开始时 ips-v4.txt 已有的 /24 网段集合（对应的 "A.B.C" 形式），
+#                     只有落在这个集合里的IP，测试结果才会被计入健康度统计；在 main() 里赋值一次。
+_subnet_health_lock = threading.Lock()
+_subnet_health = {}
+_known_hot24_keys = set()
 
 # === 轮询游标的运行期状态 ===
 # 每个池子维护一个"下一个要发的位置"下标，多线程并发时靠各自的锁保证每次都拿到不重复的下一个位置。
@@ -138,6 +171,40 @@ def _unrecord_valid_ip(ip):
             _subnet24_count[key24] -= 1
             if _subnet24_count[key24] <= 0:
                 del _subnet24_count[key24]
+
+
+def _probe_probability(consecutive_failures):
+    """根据连续失败次数，从 SUBNET_PROBE_TIERS 里查出这次真正去测的概率。"""
+    for threshold, prob in SUBNET_PROBE_TIERS:
+        if consecutive_failures >= threshold:
+            return prob
+    return 1.0  # 防御性兜底，正常情况下表里最低档是0，不会走到这里
+
+
+def _should_probe_subnet(key24):
+    """轮到某个/24网段时，按其当前连续失败次数抽签，决定这次要不要真的去测。
+    没抽中不算"判死"，只是这一轮跳过，下次轮到时重新按同样规则抽。"""
+    with _subnet_health_lock:
+        failures = _subnet_health.get(key24, 0)
+    return random.random() < _probe_probability(failures)
+
+
+def _record_subnet_test_result(ip, success):
+    """记录一次真实测试结果对"/24网段健康度"的影响：只对本次运行开始时
+    _known_hot24_keys（ips-v4.txt 已有网段）里的网段生效，不在里面的IP不处理——
+    这样才不会把"全新网段第一次没测通"也算作"该网段一直不行"。
+    只要有一次测通，立刻清零；测不通则连续失败次数+1。"""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return
+    key24 = ".".join(parts[:3])
+    if key24 not in _known_hot24_keys:
+        return
+    with _subnet_health_lock:
+        if success:
+            _subnet_health.pop(key24, None)
+        else:
+            _subnet_health[key24] = _subnet_health.get(key24, 0) + 1
 
 
 def _try_replace_full_bucket(bucket, result):
@@ -264,9 +331,11 @@ def get_final_cursor_cidrs(hot_24_sorted, hot_16_sorted):
 
 
 def _next_hot24_cidr(sorted_list):
-    """轮询选择下一个 /24 热点网段。如果轮到的网段本轮配额已满(_is_cidr_full)，
-    跳过它、游标继续往前挪，但不消耗一次测速请求名额；最多尝试一整圈，
-    如果全部都满就返回 None，交给调用方回退到全量池。"""
+    """轮询选择下一个 /24 热点网段。跳过两种情况(游标照常前进，不消耗测速请求名额)：
+    1) 本轮配额已满(_is_cidr_full)；
+    2) 按该网段当前连续失败次数算出的概率抽签没抽中(_should_probe_subnet)——
+       连续失败越多，被跳过的概率越高，但永远有机会被抽到，不会被彻底放弃。
+    最多尝试一整圈，都不满足就返回 None，交给调用方回退到全量池。"""
     if not sorted_list:
         return None
     n = len(sorted_list)
@@ -275,8 +344,12 @@ def _next_hot24_cidr(sorted_list):
             idx = _hot24_cursor_state["idx"] % n
             _hot24_cursor_state["idx"] += 1
             cidr = sorted_list[idx]
-            if not _is_cidr_full(cidr):
-                return cidr
+            if _is_cidr_full(cidr):
+                continue
+            key24 = ".".join(cidr.split("/")[0].split(".")[:3])
+            if not _should_probe_subnet(key24):
+                continue
+            return cidr
         return None
 
 
@@ -344,6 +417,42 @@ def save_known_subnets(subnets, file_path=KNOWN_SUBNETS_FILE):
                 f.write(f"{cidr}\n")
     except Exception as e:
         print(f"Warning: 保存已知网段状态文件 {file_path} 失败: {e}")
+
+
+def load_subnet_health(file_path=SUBNET_HEALTH_FILE):
+    """读取上次持久化的网段健康度（/24 前三段 -> 连续失败次数）。
+    文件不存在、某行解析失败、或次数<=0 都直接跳过，等价于"该网段健康"。"""
+    health = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    try:
+                        count = int(val.strip())
+                    except ValueError:
+                        continue
+                    if key and count > 0:
+                        health[key] = count
+        except Exception as e:
+            print(f"Warning: 读取网段健康度状态文件 {file_path} 失败: {e}")
+    return health
+
+
+def save_subnet_health(health, file_path=SUBNET_HEALTH_FILE):
+    """只写连续失败次数>0的网段，健康的网段不出现在文件里，避免文件无限膨胀。"""
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            for key in sorted(health.keys(), key=lambda k: tuple(int(x) for x in k.split("."))):
+                count = health[key]
+                if count > 0:
+                    f.write(f"{key}={count}\n")
+    except Exception as e:
+        print(f"Warning: 保存网段健康度状态文件 {file_path} 失败: {e}")
 
 
 def _random_ip_from_cidr(cidr):
@@ -752,6 +861,11 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
             return sum(len(v) for v in valid_ips_by_region.values()) >= all_mode_limit
         return all(len(valid_ips_by_region.get(r, [])) >= sync_count for r in target_regions)
 
+    # future_ip_map: 记录每个已提交future对应测的是哪个IP，只在主线程读写（提交动作本身
+    # 就是单线程串行发生的，不需要额外加锁）。结果处理阶段靠这个映射回填网段健康度统计——
+    # 不管这个候选来自hot_24轮询、hot_16、全量随机池、还是新增网段优先测，统一处理。
+    future_ip_map = {}
+
     def try_submit(executor):
         nonlocal total_submitted
         with submit_lock:
@@ -759,7 +873,9 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                 return None
             total_submitted += 1
         ip = generate_random_ip(hot_24, hot_16, all_cidrs)
-        return executor.submit(test_ip, ip, check_api_url)
+        fut = executor.submit(test_ip, ip, check_api_url)
+        future_ip_map[fut] = ip
+        return fut
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
         pending = set()
@@ -776,6 +892,7 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                 total_submitted += 1
             ip = _random_ip_from_cidr(cidr)
             fut = executor.submit(test_ip, ip, check_api_url)
+            future_ip_map[fut] = ip
             pending.add(fut)
             priority_pending.add(fut)
             priority_futures.add(fut)
@@ -793,6 +910,13 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                 priority_pending.discard(fut)
                 is_priority = fut in priority_futures
                 result = fut.result()
+
+                # 不管这次测试来自哪个候选来源（hot_24轮询/hot_16/全量随机池/新增网段优先测），
+                # 只要测的IP落在本次运行已知的/24网段里，就更新它的健康度：测通清零，测不通+1。
+                tested_ip = future_ip_map.pop(fut, None)
+                if tested_ip:
+                    _record_subnet_test_result(tested_ip, success=result is not None)
+
                 if result:
                     ip = result["ip"]
                     colo = result.get("colo", "UNK").upper()
@@ -869,6 +993,13 @@ def main():
     hot_24_sorted = sorted(hot_24_set, key=_cidr_sort_key)
     hot_16_sorted = sorted(set(hot_16), key=_cidr_sort_key)
 
+    # 网段健康度：加载上次持久化的"连续失败次数"，并记下这次运行 ips-v4.txt 里
+    # 已有哪些 /24 网段——只有落在这个集合里的IP，测试结果才会被计入健康度统计。
+    _subnet_health.update(load_subnet_health())
+    _known_hot24_keys.update(".".join(c.split("/")[0].split(".")[:3]) for c in hot_24_set)
+    if _subnet_health:
+        print(f"Loaded subnet health state: {len(_subnet_health)} subnet(s) currently in probe-cooldown.")
+
     # 轮询游标：读取上次持久化的位置，定位这次的起点（跨运行推进，不会从头开始）
     last_hot24_cursor, last_hot16_cursor = load_cursor_state()
     init_round_robin_cursors(hot_24_sorted, hot_16_sorted, last_hot24_cursor, last_hot16_cursor)
@@ -896,13 +1027,15 @@ def main():
         priority_cidrs=priority_cidrs
     )
 
-    # 保存轮询游标 + 已知网段状态：必须放在下面 total_found==0 触发 exit(1) 之前，
-    # 保证不管这次扫描有没有找到有效IP，这两个状态都会落盘，不会因为提前退出而丢失进度
-    # （这两个文件记录的是"脚本内部处理进度"，跟"这次扫描业务上有没有结果"是两回事）。
+    # 保存轮询游标 + 已知网段状态 + 网段健康度状态：必须放在下面 total_found==0 触发
+    # exit(1) 之前，保证不管这次扫描有没有找到有效IP，这些状态都会落盘，不会因为提前
+    # 退出而丢失进度（这些文件记录的是"脚本内部处理进度"，跟"这次扫描业务上有没有
+    # 结果"是两回事）。
     hot24_final_cursor, hot16_final_cursor = get_final_cursor_cidrs(hot_24_sorted, hot_16_sorted)
     save_cursor_state(hot24_final_cursor, hot16_final_cursor)
     known_next = (hot_24_set - new_subnets_all) | set(priority_cidrs)
     save_known_subnets(known_next)
+    save_subnet_health(_subnet_health)
 
     print("\nScan completed. Summary:")
     total_found = 0
