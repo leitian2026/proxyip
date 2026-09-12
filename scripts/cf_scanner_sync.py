@@ -19,7 +19,7 @@ DEFAULT_REGIONS = "SJC"
 # 子域名最终会拼成： {SUBDOMAIN_PREFIX}{地区}.{CF_TARGET_DOMAIN}
 # 比如地区是 SJC，设置 SUBDOMAIN_PREFIX = "aa" 时，子域名就会变成 aasjc.example.com
 # 留空 "" 则和原来一样，就是 sjc.example.com
-SUBDOMAIN_PREFIX = "ab"
+SUBDOMAIN_PREFIX = ""
 
 # 🌐 主域名终极大汇总同步开关
 # 设置为 "YES": 开启！将所有扫到的极品节点汇总推送到你的主域名（全球负载均衡）
@@ -29,7 +29,7 @@ SYNC_MAIN_DOMAIN = "NO"
 # 🎯 扫描与同步数量设置
 SYNC_COUNT = 5       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
-MAX_IPS_FILE = 50    # ips-v4.txt 最多保留多少个 IP
+MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
 # 最终筛选时：相同前三段(A.B.C)的IP最多入选 MAX_PER_SUBNET 个（当前=1个）；前两段相同不额外限制
@@ -84,6 +84,61 @@ SUBNET_PROBE_TIERS = [
 # SUBNET_HEALTH_FILE: 记录截止上次运行结束，仍处于"连续失败次数>0"状态的 /24 网段
 # （前三段=次数，一行一个；次数清零的网段不会出现在文件里，避免无限膨胀）。
 SUBNET_HEALTH_FILE = "subnet_health.state"
+
+# === 单个目标地区"连续完全没找到IP"的通知节流 ===
+# 跟网段健康度是同一套分档概率哲学，只是含义反过来：次数越多越倾向于"发一次提醒你"，
+# 而不是"次数越多越不想再测"。区别在于最低档——0~2次是完全正常的波动，不发通知
+# （健康度那边0~2次是"正常，照常测"，这里改成"正常，不用提醒"）。
+# 只要某次运行这个地区又找到了IP（不管最终有没有被采纳），streak立刻清零。
+# 只适用于固定地区模式(DEFAULT_REGIONS配具体地区列表)，ALL模式没有"单个地区"这个概念，不适用。
+REGION_MISS_NOTIFY_TIERS = [
+    (11, 0.05),   # 连续完全没找到 11 次及以上：5%概率提醒一次（不会完全沉默）
+    (6, 0.20),    # 连续 6~10 次：20%
+    (3, 0.50),    # 连续 3~5 次：50%
+    (0, 0.0),     # 连续 0~2 次：完全不发，太正常，不构成问题
+]
+REGION_MISS_STREAK_FILE = "region_miss_streak.state"
+
+
+def _region_miss_notify_probability(streak):
+    """根据某地区"连续完全没找到IP"的次数，查出这次要不要发通知的概率。"""
+    return _tiered_probability(streak, REGION_MISS_NOTIFY_TIERS)
+
+
+def load_region_miss_streak(file_path=REGION_MISS_STREAK_FILE):
+    """读取每个地区截止上次运行的"连续完全没找到IP"次数。文件不存在/次数<=0都跳过。"""
+    streak = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    region, val = line.split("=", 1)
+                    region = region.strip()
+                    try:
+                        n = int(val.strip())
+                    except ValueError:
+                        continue
+                    if region and n > 0:
+                        streak[region] = n
+        except Exception as e:
+            print(f"Warning: 读取地区连续失效状态文件 {file_path} 失败: {e}")
+    return streak
+
+
+def save_region_miss_streak(streak, file_path=REGION_MISS_STREAK_FILE):
+    """只写次数>0的地区，恢复正常的地区不出现在文件里，避免无限膨胀。"""
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            for region in sorted(streak.keys()):
+                count = streak[region]
+                if count > 0:
+                    f.write(f"{region}={count}\n")
+    except Exception as e:
+        print(f"Warning: 保存地区连续失效状态文件 {file_path} 失败: {e}")
+        notify_issue(f"保存状态文件 {file_path} 失败", str(e))
 
 # === 系统性故障熔断 ===
 # 背景：如果 CHECK_API_URL（检测接口）本身挂了、或者出口网络抽风，会导致这次运行里
@@ -256,12 +311,18 @@ def _unrecord_valid_ip(ip):
                 del _subnet24_count[key24]
 
 
+def _tiered_probability(value, tiers):
+    """通用的分档概率查表：按 value 从高到低匹配 tiers 里第一个满足 value>=threshold 的档位，
+    返回对应概率。tiers 需要按 threshold 从大到小排列。"""
+    for threshold, prob in tiers:
+        if value >= threshold:
+            return prob
+    return tiers[-1][1] if tiers else 0.0
+
+
 def _probe_probability(consecutive_failures):
     """根据连续失败次数，从 SUBNET_PROBE_TIERS 里查出这次真正去测的概率。"""
-    for threshold, prob in SUBNET_PROBE_TIERS:
-        if consecutive_failures >= threshold:
-            return prob
-    return 1.0  # 防御性兜底，正常情况下表里最低档是0，不会走到这里
+    return _tiered_probability(consecutive_failures, SUBNET_PROBE_TIERS)
 
 
 def _should_probe_subnet(key24):
@@ -508,6 +569,7 @@ def save_cursor_state(hot24_cursor, hot16_cursor, file_path=CURSOR_STATE_FILE):
             f.write(f"HOT16={hot16_cursor or ''}\n")
     except Exception as e:
         print(f"Warning: 保存轮询游标状态文件 {file_path} 失败: {e}")
+        notify_issue(f"保存状态文件 {file_path} 失败", str(e))
 
 
 def load_known_subnets(file_path=KNOWN_SUBNETS_FILE):
@@ -533,6 +595,7 @@ def save_known_subnets(subnets, file_path=KNOWN_SUBNETS_FILE):
                 f.write(f"{cidr}\n")
     except Exception as e:
         print(f"Warning: 保存已知网段状态文件 {file_path} 失败: {e}")
+        notify_issue(f"保存状态文件 {file_path} 失败", str(e))
 
 
 def load_subnet_health(file_path=SUBNET_HEALTH_FILE):
@@ -569,6 +632,7 @@ def save_subnet_health(health, file_path=SUBNET_HEALTH_FILE):
                     f.write(f"{key}={count}\n")
     except Exception as e:
         print(f"Warning: 保存网段健康度状态文件 {file_path} 失败: {e}")
+        notify_issue(f"保存状态文件 {file_path} 失败", str(e))
 
 
 def _random_ip_from_cidr(cidr):
@@ -738,6 +802,11 @@ def _fetch_all_dns_records(zone_id, headers, name_filter, record_type="A"):
 
 
 def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count, max_per_subnet=MAX_PER_SUBNET):
+    """
+    返回值: (success: bool, detail: str) —— detail 在失败时说明具体是哪些IP、
+    什么原因导致同步失败，方便调用方直接把这些细节带进Telegram通知，不用回头翻日志；
+    成功时 detail 是空字符串。
+    """
     headers = {
         "X-Auth-Email": cf_email,
         "X-Auth-Key": api_token,
@@ -748,7 +817,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
     try:
         existing_records = _fetch_all_dns_records(zone_id, headers, target_domain)
         if existing_records is None:
-            return False
+            return False, "获取现有DNS记录失败（Cloudflare API返回失败），详见Actions日志"
         # 同时记录每条记录的创建时间，用于"新IP不够数时，优先淘汰最旧的现有记录"
         existing_map = {
             r["content"]: {"id": r["id"], "created_on": r.get("created_on", "")}
@@ -768,6 +837,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         final_set = set(final_ips)
 
         delete_failures = []
+        delete_errors = []
         for ip_val, info in existing_map.items():
             if ip_val not in final_set:
                 print(f"Deleting outdated/over-quota IP: {ip_val} (created_on={info['created_on']})")
@@ -776,8 +846,10 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                 if not del_resp.get("success"):
                     print(f"  Warning: 删除 {ip_val} 失败: {del_resp.get('errors')}")
                     delete_failures.append(ip_val)
+                    delete_errors.append(f"{ip_val}: {del_resp.get('errors')}")
 
         add_failures = []
+        add_errors = []
         for ip_val in final_ips:
             if ip_val not in existing_map:
                 print(f"Adding new IP: {ip_val}")
@@ -793,16 +865,22 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                 if not post_resp.get("success"):
                     print(f"  Warning: 添加 {ip_val} 失败: {post_resp.get('errors')}")
                     add_failures.append(ip_val)
+                    add_errors.append(f"{ip_val}: {post_resp.get('errors')}")
 
         if delete_failures or add_failures:
             print(f"Cloudflare DNS Sync完成，但部分操作失败！删除失败: {delete_failures or '无'}；添加失败: {add_failures or '无'}")
-            return False
+            detail_parts = []
+            if add_errors:
+                detail_parts.append("添加失败: " + "; ".join(add_errors))
+            if delete_errors:
+                detail_parts.append("删除失败: " + "; ".join(delete_errors))
+            return False, "\n".join(detail_parts)[:1000]
 
         print(f"Cloudflare DNS Sync completed successfully! ({len(final_ips)}/{sync_count} records)")
-        return True
+        return True, ""
     except Exception as e:
         print(f"Exception during Cloudflare sync: {e}")
-        return False
+        return False, f"请求异常: {e}"
 
 
 SUBDOMAIN_PREFIX_STATE_FILE = "subdomain_prefix.state"
@@ -834,6 +912,7 @@ def save_last_subdomain_prefix(prefix, file_path=SUBDOMAIN_PREFIX_STATE_FILE):
             f.write(prefix)
     except Exception as e:
         print(f"Warning: 保存前缀状态文件 {file_path} 失败: {e}")
+        notify_issue(f"保存状态文件 {file_path} 失败", str(e))
 
 
 def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix, new_prefix, regions):
@@ -967,9 +1046,14 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     # 按前三段分组排序：同一个 /24 的IP连续放在一起；/24之间按数字顺序排列
     kept.sort(key=lambda ip: tuple(map(int, ip.split("."))))
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        for ip in kept:
-            f.write(f"{ip}#{existing[ip]}\n")
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            for ip in kept:
+                f.write(f"{ip}#{existing[ip]}\n")
+    except Exception as e:
+        print(f"Error: 写入 {file_path} 失败: {e}")
+        notify_issue(f"写入 {file_path} 失败，本次扫描结果未保存", str(e))
+        return
 
     print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
 
@@ -1228,11 +1312,23 @@ def main():
     # can_sync 为 False 时（没配CF凭证）不做对齐，也不更新状态文件——
     # 这样等以后配置好凭证再跑，仍然能检测到这次的前缀变化并补做对齐。
 
+    # 单地区连续没找到IP的追踪：只适用于固定地区模式，ALL模式没有"单地区"这个概念
+    region_miss_streak = {} if is_scan_all else load_region_miss_streak()
+
     for region, ips in valid_ips_by_region.items():
         print(f"- {region}: {len(ips)} valid IPs found")
         if not ips:
             print(f"  Warning: No IPs found for {region}")
+            if not is_scan_all:
+                streak = region_miss_streak.get(region, 0) + 1
+                region_miss_streak[region] = streak
+                if random.random() < _region_miss_notify_probability(streak):
+                    notify_issue(f"地区 {region} 已连续 {streak} 次运行完全没找到有效IP",
+                                  "如果长期持续，可能是该地区IP池枯竭或筛选条件过严，建议检查")
             continue
+
+        if not is_scan_all:
+            region_miss_streak.pop(region, None)  # 这次找到了，清零
 
         total_found += len(ips)
         ips.sort(key=lambda x: x["latency"])
@@ -1248,19 +1344,22 @@ def main():
         if can_sync:
             target_domain = f"{SUBDOMAIN_PREFIX}{region.lower()}.{base_domain}"
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
-            sync_ok = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
+            sync_ok, sync_detail = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
             if not sync_ok:
-                notify_issue(f"Cloudflare DNS同步失败: {target_domain}", "请查看Actions运行日志了解具体报错")
+                notify_issue(f"Cloudflare DNS同步失败: {target_domain}", sync_detail or "请查看Actions运行日志了解具体报错")
         else:
             print(f"\nSkipping Cloudflare DNS Sync for {region} (Missing Credentials).")
+
+    if not is_scan_all:
+        save_region_miss_streak(region_miss_streak)
 
     if can_sync and all_best_ips:
         if SYNC_MAIN_DOMAIN.strip().upper() == "YES":
             all_best_ips.sort(key=lambda x: x["latency"])
             print(f"\n[Global Sync] Starting Cloudflare DNS Sync for MAIN DOMAIN: {base_domain}")
-            sync_ok = sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, sync_count=len(all_best_ips))
+            sync_ok, sync_detail = sync_to_cloudflare(api_token, zone_id, base_domain, all_best_ips, cf_email, sync_count=len(all_best_ips))
             if not sync_ok:
-                notify_issue(f"Cloudflare DNS同步失败(主域名): {base_domain}", "请查看Actions运行日志了解具体报错")
+                notify_issue(f"Cloudflare DNS同步失败(主域名): {base_domain}", sync_detail or "请查看Actions运行日志了解具体报错")
         else:
             print(f"\n[Global Sync] Skipped synchronizing to MAIN DOMAIN ({base_domain}) because SYNC_MAIN_DOMAIN is set to NO.")
 
