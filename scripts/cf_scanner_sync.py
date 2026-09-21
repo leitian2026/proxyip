@@ -4,6 +4,7 @@ import time
 import threading
 import bisect
 import traceback
+import ipaddress
 import requests
 import concurrent.futures
 from datetime import datetime
@@ -27,13 +28,22 @@ SUBDOMAIN_PREFIX = "ab"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-COLLECT_COUNT = 7     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
+COLLECT_COUNT = 5     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
                       # （决定"何时停止扫描"，以及 select_diverse_ips 最终留几个）
-SYNC_COUNT = 2        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
+SYNC_COUNT = 5        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
                       # （只影响 sync_to_cloudflare 里最终落盘的DNS记录数量，跟上面
                       #  COLLECT_COUNT 相互独立：两者数值可以不一样）
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个（不受 COLLECT_COUNT / SYNC_COUNT 影响）
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
+
+# === ips-v4.txt 落盘专用排除名单 ===
+# EXCLUDED_CIDRS_FILE: 一行一个网段（CIDR格式，例如 172.69.0.0/16），支持 # 开头整行注释。
+# 只影响"这次扫到的IP最终要不要写进 ips-v4.txt"这一步：凡是落在这里任意一个网段内的
+# 结果，都不会被写入 ips-v4.txt（不会成为将来的热点网段种子）；扫描过程中它照常参与
+# 去重筛选(select_diverse_ips)、照常可以被同步到 Cloudflare，跟之前"只影响CF推送"的
+# 那个排除逻辑是两码事，两者互不影响，可以同时使用。
+# 文件不存在时视为"没有排除规则"，不会报错、也不会中断脚本。
+EXCLUDED_CIDRS_FILE = "excluded-cidrs.txt"
 
 # === 网段多样性设置 ===
 # 最终筛选时：相同前三段(A.B.C)的IP最多入选 MAX_PER_SUBNET 个（当前=1个）；前两段相同不额外限制
@@ -984,12 +994,49 @@ def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix
     return all_ok
 
 
-def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET):
+def load_excluded_cidrs(file_path=EXCLUDED_CIDRS_FILE):
+    """读取 ips-v4.txt 落盘专用的排除网段列表。一行一个CIDR，支持 # 开头整行注释，
+    格式不合法的行会跳过并打印警告，不影响其他行。文件不存在时返回空列表（不报错，
+    等价于"没有排除规则"，这是可选功能，不像 ip.txt 那样是必需文件）。"""
+    networks = []
+    if not os.path.exists(file_path):
+        return networks
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    networks.append(ipaddress.ip_network(line, strict=False))
+                except ValueError:
+                    print(f"Warning: {file_path} 中的网段 \"{line}\" 格式不合法，已跳过")
+    except Exception as e:
+        print(f"Warning: 读取 {file_path} 失败，本次不排除任何网段: {e}")
+    return networks
+
+
+def _is_ip_excluded(ip, excluded_networks):
+    """判断一个IP是否落在排除网段列表里的任意一个网段中。"""
+    if not excluded_networks:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in excluded_networks)
+
+
+def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PER_SUBNET, excluded_networks=None):
     """
     合并写入，而不是覆盖写入。
     ips-v4.txt 同样遵守网段多样性限制：相同前三段(A.B.C)最多保留 max_per_subnet 个（当前=1个），前两段不限制。
     同一个IP以本次结果刷新地区备注；历史文件中已经超过限制的旧IP也会被清理。
+    excluded_networks: 落在其中任意网段的本次新结果会被跳过、不写入（历史文件中已有的旧记录不受影响，
+    不会被回溯清理——只影响"这次新扫到的IP要不要写进去"）。
     """
+    excluded_networks = excluded_networks or []
+    excluded_count = 0
     existing = {}
     if os.path.exists(file_path):
         try:
@@ -1016,6 +1063,9 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     for item in new_sorted:
         ip = item["ip"]
         if ip in new_ip_set:
+            continue
+        if _is_ip_excluded(ip, excluded_networks):
+            excluded_count += 1
             continue
         parts = ip.split(".")
         if len(parts) != 4:
@@ -1060,6 +1110,8 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         return
 
     print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
+    if excluded_networks:
+        print(f"排除名单生效: 本次新结果中有 {excluded_count} 个IP因命中 {EXCLUDED_CIDRS_FILE} 里的网段而未写入 {file_path}。")
 
 
 def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, collect_count, all_mode_limit, priority_cidrs=None):
@@ -1212,6 +1264,10 @@ def main():
         notify_issue("未设置 CHECK_API_URL 环境变量，扫描无法启动")
         exit(1)
     collect_count = COLLECT_COUNT
+
+    excluded_networks = load_excluded_cidrs()
+    if excluded_networks:
+        print(f"Loaded {len(excluded_networks)} excluded subnet(s) from {EXCLUDED_CIDRS_FILE} (results in these subnets will not be written to ips-v4.txt).")
 
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
     print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
@@ -1378,7 +1434,7 @@ def main():
         exit(1)
 
     if all_best_ips:
-        save_ips_to_file(all_best_ips)
+        save_ips_to_file(all_best_ips, excluded_networks=excluded_networks)
 
 
 if __name__ == "__main__":
