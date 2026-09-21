@@ -28,20 +28,19 @@ SUBDOMAIN_PREFIX = "ab"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-COLLECT_COUNT = 8     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
+COLLECT_COUNT = 5     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
                       # （决定"何时停止扫描"，以及 select_diverse_ips 最终留几个）
-SYNC_COUNT = 2        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
+SYNC_COUNT = 5        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
                       # （只影响 sync_to_cloudflare 里最终落盘的DNS记录数量，跟上面
                       #  COLLECT_COUNT 相互独立：两者数值可以不一样）
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个（不受 COLLECT_COUNT / SYNC_COUNT 影响）
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
-# === ips-v4.txt 落盘专用排除名单 ===
+# === 全局排除名单（源头拦截）===
 # EXCLUDED_CIDRS_FILE: 一行一个网段（CIDR格式，例如 172.69.0.0/16），支持 # 开头整行注释。
-# 只影响"这次扫到的IP最终要不要写进 ips-v4.txt"这一步：凡是落在这里任意一个网段内的
-# 结果，都不会被写入 ips-v4.txt（不会成为将来的热点网段种子）；扫描过程中它照常参与
-# 去重筛选(select_diverse_ips)、照常可以被同步到 Cloudflare，跟之前"只影响CF推送"的
-# 那个排除逻辑是两码事，两者互不影响，可以同时使用。
+# 命中这里任意一个网段的测速结果，在 scan_stream 阶段就直接当"没测到"处理：不计入
+# collect_count 配额、不参与去重筛选(select_diverse_ips)、不会被同步到 Cloudflare、
+# 也就不会写入 ips-v4.txt——是从源头上不采纳，不是"先收集/先同步再筛掉"。
 # 文件不存在时视为"没有排除规则"，不会报错、也不会中断脚本。
 EXCLUDED_CIDRS_FILE = "excluded-cidrs.txt"
 
@@ -805,7 +804,7 @@ def _fetch_all_dns_records(zone_id, headers, name_filter, record_type="A"):
     while True:
         resp = requests.get(f"{base_url}&page={page}", headers=headers, timeout=15).json()
         if not resp.get("success"):
-            print(f"Failed to fetch DNS records for {name_filter}:", resp)
+            print(f"获取DNS记录失败（{name_filter}）:", resp)
             return None
         records.extend(resp.get("result", []))
         total_pages = resp.get("result_info", {}).get("total_pages", 1)
@@ -827,7 +826,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         "Content-Type": "application/json"
     }
 
-    print(f"Fetching existing DNS records for {target_domain}...")
+    print(f"正在获取 {target_domain} 现有的DNS记录...")
     try:
         existing_records = _fetch_all_dns_records(zone_id, headers, target_domain)
         if existing_records is None:
@@ -854,7 +853,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         delete_errors = []
         for ip_val, info in existing_map.items():
             if ip_val not in final_set:
-                print(f"Deleting outdated/over-quota IP: {ip_val} (created_on={info['created_on']})")
+                print(f"删除过期/超额的IP记录: {ip_val} (创建时间={info['created_on']})")
                 del_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{info['id']}"
                 del_resp = requests.delete(del_url, headers=headers, timeout=15).json()
                 if not del_resp.get("success"):
@@ -866,7 +865,7 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
         add_errors = []
         for ip_val in final_ips:
             if ip_val not in existing_map:
-                print(f"Adding new IP: {ip_val}")
+                print(f"新增IP记录: {ip_val}")
                 post_url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
                 data = {
                     "type": "A",
@@ -890,10 +889,10 @@ def sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sy
                 detail_parts.append("删除失败: " + "; ".join(delete_errors))
             return False, "\n".join(detail_parts)[:1000]
 
-        print(f"Cloudflare DNS Sync completed successfully! ({len(final_ips)}/{sync_count} records)")
+        print(f"Cloudflare DNS同步成功！（{len(final_ips)}/{sync_count} 条记录）")
         return True, ""
     except Exception as e:
-        print(f"Exception during Cloudflare sync: {e}")
+        print(f"Cloudflare同步过程中出现异常: {e}")
         return False, f"请求异常: {e}"
 
 
@@ -988,7 +987,7 @@ def align_subdomain_prefix(api_token, zone_id, base_domain, cf_email, old_prefix
                     print(f"  Warning: 对齐失败 {r.get('content')} ({old_domain} -> {new_domain}): {patch_resp.get('errors')}")
                     all_ok = False
     except Exception as e:
-        print(f"Exception during subdomain prefix alignment: {e}")
+        print(f"子域名前缀对齐过程中出现异常: {e}")
         return False
 
     return all_ok
@@ -1032,8 +1031,9 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     合并写入，而不是覆盖写入。
     ips-v4.txt 同样遵守网段多样性限制：相同前三段(A.B.C)最多保留 max_per_subnet 个（当前=1个），前两段不限制。
     同一个IP以本次结果刷新地区备注；历史文件中已经超过限制的旧IP也会被清理。
-    excluded_networks: 落在其中任意网段的本次新结果会被跳过、不写入（历史文件中已有的旧记录不受影响，
-    不会被回溯清理——只影响"这次新扫到的IP要不要写进去"）。
+    excluded_networks: 排除网段现在主要在 scan_stream 阶段就已经拦截，理论上不会有命中
+    这里的结果传进来；这里保留一层兜底过滤，防止上游遗漏。历史文件中已有的旧记录不受影响，
+    不会被回溯清理——只影响"这次新扫到的IP要不要写进去"。
     """
     excluded_networks = excluded_networks or []
     excluded_count = 0
@@ -1109,12 +1109,12 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
         notify_issue(f"写入 {file_path} 失败，本次扫描结果未保存", str(e))
         return
 
-    print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
+    print(f"已合并写入 {file_path}：历史 {before_count} 条 + 本次结果 -> 共 {len(kept)} 条（每个/24网段最多 {max_per_subnet} 个，总数上限 {MAX_IPS_FILE}）。")
     if excluded_networks:
         print(f"排除名单生效: 本次新结果中有 {excluded_count} 个IP因命中 {EXCLUDED_CIDRS_FILE} 里的网段而未写入 {file_path}。")
 
 
-def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, collect_count, all_mode_limit, priority_cidrs=None):
+def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, collect_count, all_mode_limit, priority_cidrs=None, excluded_networks=None):
     """
     流式扫描：线程池维持恒定并发(CONCURRENCY)，每完成一个测速请求就立刻检查一次状态，
     决定是否需要补一个新任务进去，不再有"轮次/批次"的概念。
@@ -1125,7 +1125,12 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
     但达到停止条件时，如果 priority_cidrs（本次新增网段）对应的测速请求还没跑完，
     不会立刻取消——会先停止补充新的普通候选，等这些"必须等结果"的请求全部完成后才真正停止，
     保证新增网段这次一定能拿到一个真实测试结果，不会被提前 cancel 掉。
+
+    excluded_networks: 命中这里任意网段的测试结果，直接当作"没测到"处理——不计入
+    collect_count 配额、不参与去重筛选(select_diverse_ips)、后续也就不可能被同步到
+    Cloudflare 或写入 ips-v4.txt。排除是"从源头上不采纳"，而不是"采纳了再筛掉"。
     """
+    excluded_networks = excluded_networks or []
     valid_ips_by_region = {} if is_scan_all else {r: [] for r in target_regions}
     total_submitted = 0
     submit_lock = threading.Lock()
@@ -1195,29 +1200,33 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                 if result:
                     ip = result["ip"]
                     colo = result.get("colo", "UNK").upper()
-                    if colo != "UNK" and (is_scan_all or colo in target_regions):
+                    if _is_ip_excluded(ip, excluded_networks):
+                        # 命中排除网段：当作没测到处理，不进bucket、不计配额、
+                        # 不影响 is_done() 判断——后面去重/同步/写入ips-v4.txt都碰不到它。
+                        pass
+                    elif colo != "UNK" and (is_scan_all or colo in target_regions):
                         if is_scan_all:
                             total_now = sum(len(v) for v in valid_ips_by_region.values())
                             if total_now < all_mode_limit:
                                 bucket = valid_ips_by_region.setdefault(colo, [])
                                 bucket.append(result)
                                 _record_valid_ip(ip)
-                                print(f"[FOUND {colo}] {ip} (Total ALL: {total_now + 1}/{all_mode_limit})")
+                                print(f"[发现 {colo}] {ip} (全局总数: {total_now + 1}/{all_mode_limit})")
                             elif is_priority:
                                 # 名额已经凑满，但这是新增网段的结果——挤掉一个旧条目也要把它留下
                                 if _try_replace_all_mode(valid_ips_by_region, result, colo):
                                     _record_valid_ip(ip)
-                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total ALL 仍为 {all_mode_limit})")
+                                    print(f"[发现 {colo}] {ip} (新增网段挤占名额，全局总数仍为 {all_mode_limit})")
                         else:
                             bucket = valid_ips_by_region.setdefault(colo, [])
                             if len(bucket) < collect_count:
                                 bucket.append(result)
                                 _record_valid_ip(ip)
-                                print(f"[FOUND {colo}] {ip} (Total {colo}: {len(bucket)}/{collect_count})")
+                                print(f"[发现 {colo}] {ip} (地区 {colo} 总数: {len(bucket)}/{collect_count})")
                             elif is_priority:
                                 # 名额已经凑满，但这是新增网段的结果——挤掉一个旧条目也要把它留下
                                 if _try_replace_full_bucket(bucket, result):
-                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total {colo} 仍为 {collect_count})")
+                                    print(f"[发现 {colo}] {ip} (新增网段挤占名额，地区 {colo} 总数仍为 {collect_count})")
 
             stop_requested = is_done() or total_submitted >= TOTAL_REQUEST_LIMIT
             if stop_requested and not priority_pending:
@@ -1254,9 +1263,9 @@ def main():
     is_scan_all = "ALL" in target_regions
 
     if is_scan_all:
-        print(f"Target Regions dynamically set to: ALL (Global Scan Mode)")
+        print(f"目标地区动态设置为: ALL（全局扫描模式）")
     else:
-        print(f"Target Regions dynamically set to: {target_regions}")
+        print(f"目标地区动态设置为: {target_regions}")
 
     check_api_url = os.environ.get("CHECK_API_URL")
     if not check_api_url:
@@ -1267,10 +1276,10 @@ def main():
 
     excluded_networks = load_excluded_cidrs()
     if excluded_networks:
-        print(f"Loaded {len(excluded_networks)} excluded subnet(s) from {EXCLUDED_CIDRS_FILE} (results in these subnets will not be written to ips-v4.txt).")
+        print(f"已从 {EXCLUDED_CIDRS_FILE} 加载 {len(excluded_networks)} 个排除网段（命中这些网段的结果不会被采纳，不会去重、不会同步到CF、也不会写入 ips-v4.txt）。")
 
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
-    print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
+    print(f"已从 ips-v4.txt 加载 {len(hot_24)} 个热点 /24 网段和 {len(hot_16)} 个热点 /16 网段，用于加权扫描。")
 
     # 固定顺序排序，供轮询使用（set->list 顺序不稳定，轮询必须依赖确定性顺序）
     hot_24_set = set(hot_24)
@@ -1285,7 +1294,7 @@ def main():
     _subnet_health.update(loaded_health)
     _known_hot24_keys.update(".".join(c.split("/")[0].split(".")[:3]) for c in hot_24_set)
     if _subnet_health:
-        print(f"Loaded subnet health state: {len(_subnet_health)} subnet(s) currently in probe-cooldown.")
+        print(f"已加载网段健康度状态: 当前有 {len(_subnet_health)} 个网段处于探测冷却中。")
 
     # 轮询游标：读取上次持久化的位置，定位这次的起点（跨运行推进，不会从头开始）
     last_hot24_cursor, last_hot16_cursor = load_cursor_state()
@@ -1303,17 +1312,17 @@ def main():
 
     can_sync = True
     if not all([api_token, zone_id, base_domain, cf_email]):
-        print("Warning: Missing required environment variables (CF_API_TOKEN, CF_ZONE_ID, CF_TARGET_DOMAIN, CF_EMAIL).")
-        print("DNS Synchronization will be skipped, but IP scanning will still proceed!")
+        print("Warning: 缺少必需的环境变量 (CF_API_TOKEN, CF_ZONE_ID, CF_TARGET_DOMAIN, CF_EMAIL)。")
+        print("DNS同步将被跳过，但IP扫描仍会继续进行！")
         notify_issue("Cloudflare凭证缺失，DNS同步被跳过（本次只扫描不同步）",
                      "请检查 CF_API_TOKEN / CF_ZONE_ID / CF_TARGET_DOMAIN / CF_EMAIL 这几个Secrets")
         can_sync = False
 
-    print(f"Starting streaming scan (concurrency={CONCURRENCY}, total request cap={TOTAL_REQUEST_LIMIT})...")
+    print(f"开始流式扫描（并发数={CONCURRENCY}，总请求上限={TOTAL_REQUEST_LIMIT}）...")
     valid_ips_by_region, total_submitted = scan_stream(
         hot_24_sorted, hot_16_sorted, CF_CIDRS, check_api_url,
         target_regions, is_scan_all, collect_count, ALL_MODE_LIMIT,
-        priority_cidrs=priority_cidrs
+        priority_cidrs=priority_cidrs, excluded_networks=excluded_networks
     )
 
     # 保存轮询游标 + 已知网段状态 + 网段健康度状态：必须放在下面 total_found==0 触发
@@ -1344,7 +1353,7 @@ def main():
         health_to_save = {k: v for k, v in _subnet_health.items() if k in _known_hot24_keys and v > 0}
     save_subnet_health(health_to_save)
 
-    print("\nScan completed. Summary:")
+    print("\n扫描完成。汇总如下:")
     total_found = 0
     all_best_ips = []
 
@@ -1376,9 +1385,9 @@ def main():
     region_miss_streak = {} if is_scan_all else load_region_miss_streak()
 
     for region, ips in valid_ips_by_region.items():
-        print(f"- {region}: {len(ips)} valid IPs found")
+        print(f"- {region}: 找到 {len(ips)} 个有效IP")
         if not ips:
-            print(f"  Warning: No IPs found for {region}")
+            print(f"  Warning: {region} 未找到任何IP")
             if not is_scan_all:
                 streak = region_miss_streak.get(region, 0) + 1
                 region_miss_streak[region] = streak
@@ -1397,18 +1406,18 @@ def main():
         best_ips = select_diverse_ips(ips, limit)
         all_best_ips.extend(best_ips)
 
-        print(f"\n--- Top {len(best_ips)} Diversity-Limited IPs Selected for {region} ---")
+        print(f"\n--- {region} 经多样性筛选后选出的前 {len(best_ips)} 个IP ---")
         for ip in best_ips:
-            print(f"IP: {ip['ip']:<15} | Latency: {ip['latency']:>3}ms | Colo: {ip['colo']}")
+            print(f"IP: {ip['ip']:<15} | 延迟: {ip['latency']:>3}ms | 数据中心: {ip['colo']}")
 
         if can_sync:
             target_domain = f"{SUBDOMAIN_PREFIX}{region.lower()}.{base_domain}"
-            print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
+            print(f"\n开始为 {target_domain} 同步 Cloudflare DNS...")
             sync_ok, sync_detail = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=SYNC_COUNT)
             if not sync_ok:
                 notify_issue(f"Cloudflare DNS同步失败: {target_domain}", sync_detail or "请查看Actions运行日志了解具体报错")
         else:
-            print(f"\nSkipping Cloudflare DNS Sync for {region} (Missing Credentials).")
+            print(f"\n跳过 {region} 的Cloudflare DNS同步（缺少凭证）。")
 
     if not is_scan_all:
         save_region_miss_streak(region_miss_streak)
