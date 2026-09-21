@@ -28,9 +28,9 @@ SUBDOMAIN_PREFIX = "ab"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-COLLECT_COUNT = 5     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
+COLLECT_COUNT = 8     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
                       # （决定"何时停止扫描"，以及 select_diverse_ips 最终留几个）
-SYNC_COUNT = 5        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
+SYNC_COUNT = 2        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
                       # （只影响 sync_to_cloudflare 里最终落盘的DNS记录数量，跟上面
                       #  COLLECT_COUNT 相互独立：两者数值可以不一样）
 ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个（不受 COLLECT_COUNT / SYNC_COUNT 影响）
