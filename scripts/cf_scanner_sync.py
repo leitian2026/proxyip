@@ -27,8 +27,12 @@ SUBDOMAIN_PREFIX = "ab"
 SYNC_MAIN_DOMAIN = "NO"
 
 # 🎯 扫描与同步数量设置
-SYNC_COUNT = 5       # 每个地区最终要同步几个 IP 到 Cloudflare DNS
-ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个
+COLLECT_COUNT = 5     # 【扫描/去重】每个地区扫描阶段要收集并经多样性筛选后保留几个候选 IP
+                      # （决定"何时停止扫描"，以及 select_diverse_ips 最终留几个）
+SYNC_COUNT = 5        # 【同步】每个地区最终要同步几条记录到 Cloudflare DNS
+                      # （只影响 sync_to_cloudflare 里最终落盘的DNS记录数量，跟上面
+                      #  COLLECT_COUNT 相互独立：两者数值可以不一样）
+ALL_MODE_LIMIT = 20   # ALL 模式下全局总共选几个（不受 COLLECT_COUNT / SYNC_COUNT 影响）
 MAX_IPS_FILE = 100    # ips-v4.txt 最多保留多少个 IP
 
 # === 网段多样性设置 ===
@@ -380,7 +384,7 @@ def is_systemic_failure_suspected():
 
 
 def _try_replace_full_bucket(bucket, result):
-    """某地区的bucket已经凑满 sync_count 时，让"新增网段优先测"的结果强行挤进去，
+    """某地区的bucket已经凑满 collect_count 时，让"新增网段优先测"的结果强行挤进去，
     替换掉一个旧条目，bucket总长度不变（不突破配额上限）：
       1. 优先替换掉bucket里跟新结果同一个 /24 网段的旧条目——反正同网段最终选择阶段
          (select_diverse_ips, MAX_PER_SUBNET=1) 也只会留1个，谁留下不影响配额计数，
@@ -1058,13 +1062,13 @@ def save_ips_to_file(new_best_ips, file_path="ips-v4.txt", max_per_subnet=MAX_PE
     print(f"Merged IPs into {file_path}: {before_count} historical + this run -> {len(kept)} total (max {max_per_subnet} per /24, max {MAX_IPS_FILE} total).")
 
 
-def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, sync_count, all_mode_limit, priority_cidrs=None):
+def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_scan_all, collect_count, all_mode_limit, priority_cidrs=None):
     """
     流式扫描：线程池维持恒定并发(CONCURRENCY)，每完成一个测速请求就立刻检查一次状态，
     决定是否需要补一个新任务进去，不再有"轮次/批次"的概念。
 
     停止条件（满足任一即停）：
-      1. 每个目标地区都凑够了 sync_count 个原始命中（ALL模式下是全局凑够 all_mode_limit 个）
+      1. 每个目标地区都凑够了 collect_count 个原始命中（ALL模式下是全局凑够 all_mode_limit 个）
       2. 累计发起的测速请求总数达到 TOTAL_REQUEST_LIMIT 硬上限
     但达到停止条件时，如果 priority_cidrs（本次新增网段）对应的测速请求还没跑完，
     不会立刻取消——会先停止补充新的普通候选，等这些"必须等结果"的请求全部完成后才真正停止，
@@ -1078,7 +1082,7 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
     def is_done():
         if is_scan_all:
             return sum(len(v) for v in valid_ips_by_region.values()) >= all_mode_limit
-        return all(len(valid_ips_by_region.get(r, [])) >= sync_count for r in target_regions)
+        return all(len(valid_ips_by_region.get(r, [])) >= collect_count for r in target_regions)
 
     # future_ip_map: 记录每个已提交future对应测的是哪个IP，只在主线程读写（提交动作本身
     # 就是单线程串行发生的，不需要额外加锁）。结果处理阶段靠这个映射回填网段健康度统计——
@@ -1154,14 +1158,14 @@ def scan_stream(hot_24, hot_16, all_cidrs, check_api_url, target_regions, is_sca
                                     print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total ALL 仍为 {all_mode_limit})")
                         else:
                             bucket = valid_ips_by_region.setdefault(colo, [])
-                            if len(bucket) < sync_count:
+                            if len(bucket) < collect_count:
                                 bucket.append(result)
                                 _record_valid_ip(ip)
-                                print(f"[FOUND {colo}] {ip} (Total {colo}: {len(bucket)}/{sync_count})")
+                                print(f"[FOUND {colo}] {ip} (Total {colo}: {len(bucket)}/{collect_count})")
                             elif is_priority:
                                 # 名额已经凑满，但这是新增网段的结果——挤掉一个旧条目也要把它留下
                                 if _try_replace_full_bucket(bucket, result):
-                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total {colo} 仍为 {sync_count})")
+                                    print(f"[FOUND {colo}] {ip} (新增网段挤占名额，Total {colo} 仍为 {collect_count})")
 
             stop_requested = is_done() or total_submitted >= TOTAL_REQUEST_LIMIT
             if stop_requested and not priority_pending:
@@ -1207,7 +1211,7 @@ def main():
         print("Error: 未设置环境变量 CHECK_API_URL（测速检测接口地址），扫描无法进行，直接退出。")
         notify_issue("未设置 CHECK_API_URL 环境变量，扫描无法启动")
         exit(1)
-    sync_count = SYNC_COUNT
+    collect_count = COLLECT_COUNT
 
     hot_24, hot_16 = load_hot_subnets("ips-v4.txt")
     print(f"Loaded {len(hot_24)} hot /24 subnets and {len(hot_16)} hot /16 subnets from ips-v4.txt for weighted scanning.")
@@ -1252,7 +1256,7 @@ def main():
     print(f"Starting streaming scan (concurrency={CONCURRENCY}, total request cap={TOTAL_REQUEST_LIMIT})...")
     valid_ips_by_region, total_submitted = scan_stream(
         hot_24_sorted, hot_16_sorted, CF_CIDRS, check_api_url,
-        target_regions, is_scan_all, sync_count, ALL_MODE_LIMIT,
+        target_regions, is_scan_all, collect_count, ALL_MODE_LIMIT,
         priority_cidrs=priority_cidrs
     )
 
@@ -1333,7 +1337,7 @@ def main():
         total_found += len(ips)
         ips.sort(key=lambda x: x["latency"])
 
-        limit = ALL_MODE_LIMIT if is_scan_all else sync_count
+        limit = ALL_MODE_LIMIT if is_scan_all else collect_count
         best_ips = select_diverse_ips(ips, limit)
         all_best_ips.extend(best_ips)
 
@@ -1344,7 +1348,7 @@ def main():
         if can_sync:
             target_domain = f"{SUBDOMAIN_PREFIX}{region.lower()}.{base_domain}"
             print(f"\nStarting Cloudflare DNS Sync for {target_domain}...")
-            sync_ok, sync_detail = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=sync_count)
+            sync_ok, sync_detail = sync_to_cloudflare(api_token, zone_id, target_domain, best_ips, cf_email, sync_count=SYNC_COUNT)
             if not sync_ok:
                 notify_issue(f"Cloudflare DNS同步失败: {target_domain}", sync_detail or "请查看Actions运行日志了解具体报错")
         else:
